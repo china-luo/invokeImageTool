@@ -1,0 +1,192 @@
+import gguf
+import pytest
+import torch
+
+from invokeai.backend.quantization.gguf.ggml_tensor import GGMLTensor
+from invokeai.backend.quantization.gguf.utils import DEQUANTIZE_FUNCTIONS, TORCH_COMPATIBLE_QTYPES
+from invokeai.backend.util.calc_tensor_size import calc_tensor_size
+
+
+def quantize_tensor(data: torch.Tensor, ggml_quantization_type: gguf.GGMLQuantizationType) -> GGMLTensor:
+    """Quantize a torch.Tensor to a GGMLTensor.
+
+    Uses the gguf library's numpy implementation to quantize the tensor.
+    """
+    data_np = data.detach().cpu().numpy()
+    quantized_np = gguf.quantize(data_np, ggml_quantization_type)
+    return GGMLTensor(
+        data=torch.from_numpy(quantized_np),
+        ggml_quantization_type=ggml_quantization_type,
+        tensor_shape=data.shape,
+        compute_dtype=data.dtype,
+    ).to(device=data.device)  # type: ignore
+
+
+@pytest.mark.parametrize(
+    ["device", "x1_quant_type", "x2_quant_type"],
+    [
+        # Test with no quantization.
+        ("cpu", None, None),
+        # Test with Q8_0 quantization.
+        ("cpu", gguf.GGMLQuantizationType.Q8_0, gguf.GGMLQuantizationType.Q8_0),
+        ("cpu", None, gguf.GGMLQuantizationType.Q8_0),
+        ("cpu", gguf.GGMLQuantizationType.Q8_0, None),
+        # Test with F16 quantization (i.e. torch-compmatible quantization).
+        ("cpu", gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.F16),
+        ("cpu", None, gguf.GGMLQuantizationType.F16),
+        ("cpu", gguf.GGMLQuantizationType.F16, None),
+        # Test all of above cases on CUDA.
+        ("cuda", None, None),
+        # Test with Q8_0 quantization.
+        ("cuda", gguf.GGMLQuantizationType.Q8_0, gguf.GGMLQuantizationType.Q8_0),
+        ("cuda", None, gguf.GGMLQuantizationType.Q8_0),
+        ("cuda", gguf.GGMLQuantizationType.Q8_0, None),
+        # Test with F16 quantization (i.e. torch-compmatible quantization).
+        ("cuda", gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.F16),
+        ("cuda", None, gguf.GGMLQuantizationType.F16),
+        ("cuda", gguf.GGMLQuantizationType.F16, None),
+    ],
+)
+def test_ggml_tensor_multiply(
+    device: str, x1_quant_type: gguf.GGMLQuantizationType | None, x2_quant_type: gguf.GGMLQuantizationType | None
+):
+    # Skip test if CUDA is not available.
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+
+    generator = torch.Generator().manual_seed(123)
+
+    x1 = torch.randn(32, 64, generator=generator).to(device=device)
+    x2 = torch.randn(32, 64, generator=generator).to(device=device)
+
+    # Quantize the tensors.
+    x1_quantized = quantize_tensor(x1, x1_quant_type) if x1_quant_type is not None else x1
+    x2_quantized = quantize_tensor(x2, x2_quant_type) if x2_quant_type is not None else x2
+
+    # Check devices.
+    for x in [x1, x2, x1_quantized, x2_quantized]:
+        assert x.device.type == device
+
+    # Perform the multiplication.
+    result = x1 * x2
+    result_quantized = x1_quantized * x2_quantized
+
+    assert result.shape == result_quantized.shape
+    assert result.dtype == result_quantized.dtype
+    assert torch.allclose(result, result_quantized, atol=1e-1)
+
+
+def test_ggml_tensor_to_dtype_raises_error():
+    x = torch.randn(32, 64)
+    x_quantized = quantize_tensor(x, gguf.GGMLQuantizationType.Q8_0)
+
+    with pytest.raises(ValueError):
+        x_quantized.to(dtype=torch.float32)
+
+    with pytest.raises(ValueError):
+        x_quantized.float()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device")
+def test_ggml_tensor_to_device():
+    x = torch.randn(32, 64)
+    x_cpu = quantize_tensor(x, gguf.GGMLQuantizationType.Q8_0)
+
+    x_gpu = x_cpu.to(device=torch.device("cuda"))
+
+    assert x_cpu.device.type == "cpu"
+    assert x_gpu.device.type == "cuda"
+
+    assert torch.allclose(x_cpu.quantized_data, x_gpu.quantized_data.cpu(), atol=1e-5)
+
+
+def test_ggml_tensor_shape():
+    x = torch.randn(32, 64)
+    x_quantized = quantize_tensor(x, gguf.GGMLQuantizationType.Q8_0)
+
+    assert x_quantized.shape == x.shape
+    assert x_quantized.size() == x.size()
+
+
+def test_ggml_tensor_quantized_shape():
+    x = torch.randn(32, 64)
+    x_quantized = quantize_tensor(x, gguf.GGMLQuantizationType.Q8_0)
+
+    # This is mainly just a smoke test to confirm that .quantized_shape can be accesses and doesn't hit any weird
+    # dispatch errors.
+    assert x_quantized.quantized_shape != x.shape
+
+
+def test_ggml_tensor_calc_size():
+    """Test that the calc_tensor_size(...) utility function correctly uses the underlying quantized tensor to calculate
+    size rather than the unquantized tensor.
+    """
+    x = torch.randn(32, 64)
+    x_quantized = quantize_tensor(x, gguf.GGMLQuantizationType.Q8_0)
+
+    compression_ratio = calc_tensor_size(x) / calc_tensor_size(x_quantized)
+    # Assert that the compression ratio is approximately 4x.
+    assert abs(compression_ratio - 4) < 0.5
+
+
+def test_ggml_tensor_numpy_fallback_dequantize_uses_logical_shape():
+    """Qtypes without a torch dequantize kernel fall back to numpy, which infers the shape from the stored data.
+
+    ComfyUI reshapes tensors before quantizing them, so the stored shape is not necessarily the logical one - the
+    fallback must still return the logical shape (see GGMLTensor.tensor_shape).
+    """
+    qtype = gguf.GGMLQuantizationType.IQ4_NL
+    assert qtype not in DEQUANTIZE_FUNCTIONS and qtype not in TORCH_COMPATIBLE_QTYPES
+
+    # One IQ4_NL block is 32 elements in 18 bytes, so this holds 8 rows of 32 elements = 256 elements, which the
+    # numpy fallback dequantizes to (8, 32). The logical shape is a different view of the same 256 elements.
+    generator = torch.Generator().manual_seed(123)
+    quantized = torch.randint(0, 256, (8, 18), dtype=torch.uint8, generator=generator)
+    logical_shape = torch.Size((4, 64))
+
+    t = GGMLTensor(
+        data=quantized,
+        ggml_quantization_type=qtype,
+        tensor_shape=logical_shape,
+        compute_dtype=torch.float32,
+    )
+
+    assert t.get_dequantized_tensor().shape == logical_shape
+
+
+def _gguf_linear(in_features: int, out_features: int) -> torch.nn.Linear:
+    linear = torch.nn.Linear(in_features, out_features, bias=False)
+    linear.weight = torch.nn.Parameter(
+        quantize_tensor(torch.zeros(out_features, in_features), gguf.GGMLQuantizationType.Q8_0), requires_grad=False
+    )
+    return linear
+
+
+def test_the_shared_dequant_transient_counts_gguf_linears():
+    """Every denoise and encoder node sizes its reservation with `peak_dequant_transient_bytes`, so a GGUF
+    Linear -- dequantized into a full copy on every forward -- has to count there, as an int8 one does.
+    It is the largest layer that counts, whichever scheme it uses, since the layers run one at a time."""
+    from invokeai.backend.quantization.dequantizing_linear import peak_dequant_transient_bytes
+    from invokeai.backend.quantization.int8_convrot import Int8ConvrotLinear
+
+    gguf_model = torch.nn.Sequential(_gguf_linear(64, 128), _gguf_linear(64, 32))
+    largest = gguf_model[0].weight
+    gguf_peak = peak_dequant_transient_bytes(gguf_model, torch.float32)
+
+    # At least the copy of the larger layer, in the weight's own compute dtype, plus its packed bytes;
+    # never the sum of both layers.
+    assert gguf_peak > largest.tensor_shape.numel() * largest.compute_dtype.itemsize + largest.quantized_data.nbytes
+    assert gguf_peak == peak_dequant_transient_bytes(torch.nn.Sequential(gguf_model[0]), torch.float32)
+
+    # Whichever scheme holds the largest layer decides, in either order.
+    larger_int8 = Int8ConvrotLinear(
+        weight=torch.zeros(4096, 4096, dtype=torch.int8), weight_scale=torch.ones(4096, 1), convrot=False
+    )
+    mixed = torch.nn.Sequential(gguf_model[0], larger_int8)
+    assert peak_dequant_transient_bytes(mixed, torch.float32) == larger_int8.dequant_transient_bytes(torch.float32)
+    smaller_int8 = Int8ConvrotLinear(
+        weight=torch.zeros(8, 64, dtype=torch.int8), weight_scale=torch.ones(8, 1), convrot=False
+    )
+    assert smaller_int8.dequant_transient_bytes(torch.float32) < gguf_peak
+    assert peak_dequant_transient_bytes(torch.nn.Sequential(smaller_int8, gguf_model[0]), torch.float32) == gguf_peak
+    assert peak_dequant_transient_bytes(torch.nn.Sequential(torch.nn.Linear(64, 64)), torch.float32) == 0

@@ -1,0 +1,553 @@
+"""Integration tests for authentication router endpoints."""
+
+import os
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+from fastapi.testclient import TestClient
+
+from invokeai.app.api.dependencies import ApiDependencies
+from invokeai.app.api_app import app
+from invokeai.app.services.auth.token_service import set_jwt_secret
+from invokeai.app.services.invoker import Invoker
+from invokeai.app.services.users.users_common import UserCreateRequest
+
+
+@pytest.fixture(autouse=True, scope="module")
+def setup_jwt_secret():
+    """Set up JWT secret for all tests in this module."""
+    # Use a test secret key
+    set_jwt_secret("test-secret-key-for-unit-tests-only-do-not-use-in-production")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def client(invokeai_root_dir: Path) -> TestClient:
+    """Create a test client for the FastAPI app."""
+    os.environ["INVOKEAI_ROOT"] = invokeai_root_dir.as_posix()
+    return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def enable_multiuser_for_auth_tests(mock_invoker: Invoker) -> None:
+    """Enable multiuser mode for auth tests.
+
+    Auth tests need multiuser mode enabled since the login/setup endpoints
+    return 403 when multiuser is disabled.
+    """
+    mock_invoker.services.configuration.multiuser = True
+
+
+class MockApiDependencies(ApiDependencies):
+    """Mock API dependencies for testing."""
+
+    invoker: Invoker
+
+    def __init__(self, invoker) -> None:
+        self.invoker = invoker
+
+
+def setup_test_user(mock_invoker: Invoker, email: str = "test@example.com", password: str = "TestPass123") -> str:
+    """Helper to create a test user and return user_id."""
+    user_service = mock_invoker.services.users
+    user_data = UserCreateRequest(
+        email=email,
+        display_name="Test User",
+        password=password,
+        is_admin=False,
+    )
+    user = user_service.create(user_data)
+    return user.user_id
+
+
+def setup_test_admin(mock_invoker: Invoker, email: str = "admin@example.com", password: str = "AdminPass123") -> str:
+    """Helper to create a test admin user and return user_id."""
+    user_service = mock_invoker.services.users
+    user_data = UserCreateRequest(
+        email=email,
+        display_name="Admin User",
+        password=password,
+        is_admin=True,
+    )
+    user = user_service.create(user_data)
+    return user.user_id
+
+
+def test_login_success(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test successful login with valid credentials."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    # Create a test user
+    setup_test_user(mock_invoker, "test@example.com", "TestPass123")
+
+    # Attempt login
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "test@example.com",
+            "password": "TestPass123",
+            "remember_me": False,
+        },
+    )
+
+    assert response.status_code == 200
+    json_response = response.json()
+    assert "token" in json_response
+    assert "user" in json_response
+    assert "expires_in" in json_response
+    assert json_response["user"]["email"] == "test@example.com"
+    assert json_response["user"]["is_admin"] is False
+    assert response.cookies.get("invokeai_media_token") == json_response["token"]
+    assert "HttpOnly" in response.headers["set-cookie"]
+    assert "Path=/api/v1" in response.headers["set-cookie"]
+
+
+def test_login_with_remember_me(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test login with remember_me flag sets longer expiration."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    setup_test_user(mock_invoker, "test2@example.com", "TestPass123")
+
+    # Login with remember_me=True
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "test2@example.com",
+            "password": "TestPass123",
+            "remember_me": True,
+        },
+    )
+
+    assert response.status_code == 200
+    json_response = response.json()
+    # Remember me should give 7 days = 604800 seconds
+    assert json_response["expires_in"] == 604800
+
+
+def test_login_invalid_password(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test login fails with invalid password."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    setup_test_user(mock_invoker, "test3@example.com", "TestPass123")
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "test3@example.com",
+            "password": "WrongPassword",
+            "remember_me": False,
+        },
+    )
+
+    assert response.status_code == 401
+    assert "Incorrect email or password" in response.json()["detail"]
+
+
+def test_login_nonexistent_user(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test login fails with nonexistent user."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "nonexistent@example.com",
+            "password": "TestPass123",
+            "remember_me": False,
+        },
+    )
+
+    assert response.status_code == 401
+    assert "Incorrect email or password" in response.json()["detail"]
+
+
+def test_login_inactive_user(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test login fails with inactive user."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    user_id = setup_test_user(mock_invoker, "inactive@example.com", "TestPass123")
+
+    # Deactivate the user
+    user_service = mock_invoker.services.users
+    from invokeai.app.services.users.users_common import UserUpdateRequest
+
+    user_service.update(user_id, UserUpdateRequest(is_active=False))
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "inactive@example.com",
+            "password": "TestPass123",
+            "remember_me": False,
+        },
+    )
+
+    assert response.status_code == 403
+    assert "disabled" in response.json()["detail"]
+
+
+def test_logout(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test logout endpoint."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+    monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    setup_test_user(mock_invoker, "test4@example.com", "TestPass123")
+
+    # Login first to get token
+    login_response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "test4@example.com",
+            "password": "TestPass123",
+            "remember_me": False,
+        },
+    )
+    token = login_response.json()["token"]
+
+    # Logout with token
+    response = client.post("/api/v1/auth/logout", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+
+
+def test_logout_without_token(client: TestClient) -> None:
+    """Test logout fails without authentication token."""
+    response = client.post("/api/v1/auth/logout")
+
+    assert response.status_code == 401
+
+
+def test_get_current_user_info(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test getting current user info with valid token."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+    monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    setup_test_user(mock_invoker, "test5@example.com", "TestPass123")
+
+    # Login to get token
+    login_response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "test5@example.com",
+            "password": "TestPass123",
+            "remember_me": False,
+        },
+    )
+    token = login_response.json()["token"]
+
+    # Get user info
+    response = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["email"] == "test5@example.com"
+    assert json_response["display_name"] == "Test User"
+    assert json_response["is_admin"] is False
+
+
+def test_get_current_user_info_without_token(client: TestClient) -> None:
+    """Test getting user info fails without token."""
+    response = client.get("/api/v1/auth/me")
+
+    assert response.status_code == 401
+
+
+def test_get_current_user_info_invalid_token(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test getting user info fails with invalid token."""
+    monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    response = client.get("/api/v1/auth/me", headers={"Authorization": "Bearer invalid_token"})
+
+    assert response.status_code == 401
+
+
+def test_setup_admin_first_time(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test setting up first admin user."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    response = client.post(
+        "/api/v1/auth/setup",
+        json={
+            "email": "admin@example.com",
+            "display_name": "Admin User",
+            "password": "AdminPass123",
+        },
+    )
+
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["success"] is True
+    assert json_response["user"]["email"] == "admin@example.com"
+    assert json_response["user"]["is_admin"] is True
+
+
+def test_delete_user_emits_revocation_when_font_cleanup_fails(
+    monkeypatch: Any, mock_invoker: Invoker, client: TestClient
+) -> None:
+    """A cleanup failure cannot leave the deleted user's live sessions authorized."""
+    dependencies = MockApiDependencies(mock_invoker)
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", dependencies)
+    monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", dependencies)
+
+    setup_test_admin(mock_invoker, "delete-admin@example.com", "AdminPass123")
+    deleted_user_id = setup_test_user(mock_invoker, "delete-target@example.com", "TestPass123")
+    admin_token = client.post(
+        "/api/v1/auth/login",
+        json={"email": "delete-admin@example.com", "password": "AdminPass123", "remember_me": False},
+    ).json()["token"]
+
+    fonts = MagicMock()
+    fonts.prepare_user_cleanup.return_value = ()
+    fonts.cleanup_user.side_effect = OSError("storage unavailable")
+    mock_invoker.services.fonts = fonts
+    events = mock_invoker.services.events
+    events.emit_user_access_changed = MagicMock()
+
+    response = client.delete(
+        f"/api/v1/auth/users/{deleted_user_id}", headers={"Authorization": f"Bearer {admin_token}"}
+    )
+
+    assert response.status_code == 204
+    assert mock_invoker.services.users.get(deleted_user_id) is None
+    events.emit_user_access_changed.assert_called_once_with(user_id=deleted_user_id, is_admin=False, is_active=False)
+    fonts.prepare_user_cleanup.assert_called_once_with(deleted_user_id)
+    fonts.cleanup_user.assert_called_once_with(deleted_user_id, ())
+
+
+def test_setup_admin_already_exists(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test setup fails when admin already exists."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    # Create first admin
+    setup_test_admin(mock_invoker, "admin1@example.com", "AdminPass123")
+
+    # Try to setup another admin
+    response = client.post(
+        "/api/v1/auth/setup",
+        json={
+            "email": "admin2@example.com",
+            "display_name": "Second Admin",
+            "password": "AdminPass123",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "already configured" in response.json()["detail"]
+
+
+def test_setup_admin_weak_password(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test setup fails with weak password when strict password checking is enabled."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+    mock_invoker.services.configuration.strict_password_checking = True
+
+    response = client.post(
+        "/api/v1/auth/setup",
+        json={
+            "email": "admin3@example.com",
+            "display_name": "Admin User",
+            "password": "weak",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Password" in response.json()["detail"]
+
+
+def test_setup_admin_weak_password_non_strict(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test setup succeeds with weak password when strict password checking is disabled (the default)."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+    mock_invoker.services.configuration.strict_password_checking = False
+
+    response = client.post(
+        "/api/v1/auth/setup",
+        json={
+            "email": "admin3b@example.com",
+            "display_name": "Admin User",
+            "password": "weak",
+        },
+    )
+
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["success"] is True
+
+
+def test_admin_user_token_has_admin_flag(monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+    """Test that admin user login returns token with admin flag."""
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+
+    setup_test_admin(mock_invoker, "admin4@example.com", "AdminPass123")
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "admin4@example.com",
+            "password": "AdminPass123",
+            "remember_me": False,
+        },
+    )
+
+    assert response.status_code == 200
+    json_response = response.json()
+    assert json_response["user"]["is_admin"] is True
+
+
+class TestRefreshMediaCookie:
+    """POST /api/v1/auth/media-cookie — self-healing for sessions that hold a valid
+    JWT but no media cookie (session predates the cookie, or the cookie was cleared).
+    Without it, every API call works but <video> requests 401 and the player renders
+    black (PR #9163 functional testing)."""
+
+    def _login(self, monkeypatch: Any, mock_invoker: Invoker, client: TestClient, email: str) -> str:
+        monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+        # The media-cookie route authenticates via CurrentUserOrDefault, which reads
+        # ApiDependencies from the auth_dependencies module.
+        monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", MockApiDependencies(mock_invoker))
+        setup_test_user(mock_invoker, email, "TestPass123")
+        response = client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "TestPass123", "remember_me": False},
+        )
+        assert response.status_code == 200
+        return response.json()["token"]
+
+    def test_reissues_cookie_from_bearer_token(
+        self, monkeypatch: Any, mock_invoker: Invoker, client: TestClient
+    ) -> None:
+        token = self._login(monkeypatch, mock_invoker, client, "mediacookie@example.com")
+
+        # Simulate the stale-session state: valid JWT in hand, no cookie in the jar.
+        client.cookies.clear()
+
+        response = client.post("/api/v1/auth/media-cookie", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert response.cookies.get("invokeai_media_token") == token
+        set_cookie = response.headers["set-cookie"]
+        assert "HttpOnly" in set_cookie
+        assert "Path=/api/v1" in set_cookie
+        # Cookie must not outlive the token: max-age is clamped to the remaining
+        # validity (1-day login here, minus the instants since).
+        max_age = int(set_cookie.split("Max-Age=")[1].split(";")[0])
+        assert 0 < max_age <= 24 * 3600
+
+    def test_requires_bearer_token(self, monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+        monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+        monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", MockApiDependencies(mock_invoker))
+        client.cookies.clear()
+        response = client.post("/api/v1/auth/media-cookie")
+        assert response.status_code == 401
+
+    def test_rejects_invalid_token(self, monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+        monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+        monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", MockApiDependencies(mock_invoker))
+        response = client.post("/api/v1/auth/media-cookie", headers={"Authorization": "Bearer not-a-jwt"})
+        assert response.status_code == 401
+        assert response.cookies.get("invokeai_media_token") is None
+
+    def test_rejects_deactivated_user(self, monkeypatch: Any, mock_invoker: Invoker, client: TestClient) -> None:
+        """A still-valid token for a since-deactivated user must not mint a cookie —
+        the cookie grants media access, so it needs the same live-user check as
+        get_current_user."""
+        from invokeai.app.services.users.users_common import UserUpdateRequest
+
+        token = self._login(monkeypatch, mock_invoker, client, "deactivated@example.com")
+        user = mock_invoker.services.users.get_by_email("deactivated@example.com")
+        mock_invoker.services.users.update(user.user_id, UserUpdateRequest(is_active=False))
+        client.cookies.clear()
+
+        response = client.post("/api/v1/auth/media-cookie", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 401
+        assert response.cookies.get("invokeai_media_token") is None
+
+    def test_single_user_mode_is_a_successful_noop(
+        self, monkeypatch: Any, mock_invoker: Invoker, client: TestClient
+    ) -> None:
+        """In single-user mode media routes don't require auth; the frontend may
+        still call this on load, so it must succeed without setting a cookie."""
+        monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+        monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", MockApiDependencies(mock_invoker))
+        mock_invoker.services.configuration.multiuser = False
+        client.cookies.clear()
+
+        response = client.post("/api/v1/auth/media-cookie")
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert response.cookies.get("invokeai_media_token") is None
+
+
+class TestMediaCookieBehindSubPathProxy:
+    """The media cookie must be scoped to the *public* path when the app is served
+    under a reverse-proxy sub-path — browsers match cookie paths against the URL
+    they requested, so a cookie scoped to `/api/v1` is never sent to
+    `/invoke/api/v1/videos/...`."""
+
+    BASE_PATH = "/invoke"
+
+    def _proxied_client(self, preserve: bool) -> TestClient:
+        from invokeai.app.api_app import SubPathASGIMiddleware
+
+        wrapped = SubPathASGIMiddleware(app, self.BASE_PATH)
+        root = f"http://testserver{self.BASE_PATH}" if preserve else "http://testserver"
+        return TestClient(wrapped, base_url=root)
+
+    def _login(self, client: TestClient, email: str) -> tuple[str, Any]:
+        response = client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "TestPass123", "remember_me": False},
+        )
+        assert response.status_code == 200
+        return response.json()["token"], response
+
+    @pytest.mark.parametrize("preserve", [True, False], ids=["preserve", "strip"])
+    def test_login_scopes_cookie_to_public_prefix(
+        self, preserve: bool, monkeypatch: Any, mock_invoker: Invoker
+    ) -> None:
+        monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+        setup_test_user(mock_invoker, f"proxy-login-{preserve}@example.com", "TestPass123")
+        client = self._proxied_client(preserve)
+
+        _token, response = self._login(client, f"proxy-login-{preserve}@example.com")
+
+        assert f"Path={self.BASE_PATH}/api/v1" in response.headers["set-cookie"]
+
+    @pytest.mark.parametrize("preserve", [True, False], ids=["preserve", "strip"])
+    def test_media_cookie_endpoint_scopes_cookie_to_public_prefix(
+        self, preserve: bool, monkeypatch: Any, mock_invoker: Invoker
+    ) -> None:
+        monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+        monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", MockApiDependencies(mock_invoker))
+        setup_test_user(mock_invoker, f"proxy-media-{preserve}@example.com", "TestPass123")
+        client = self._proxied_client(preserve)
+        token, _ = self._login(client, f"proxy-media-{preserve}@example.com")
+        client.cookies.clear()
+
+        response = client.post("/api/v1/auth/media-cookie", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200
+        assert f"Path={self.BASE_PATH}/api/v1" in response.headers["set-cookie"]
+
+    @pytest.mark.parametrize("preserve", [True, False], ids=["preserve", "strip"])
+    def test_logout_deletes_cookie_at_public_prefix_without_reminting(
+        self, preserve: bool, monkeypatch: Any, mock_invoker: Invoker
+    ) -> None:
+        """Logout must delete the cookie at the prefixed path, and the sliding-window
+        middleware must not mint a replacement token/cookie for the proxied logout URL."""
+        monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", MockApiDependencies(mock_invoker))
+        monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", MockApiDependencies(mock_invoker))
+        setup_test_user(mock_invoker, f"proxy-logout-{preserve}@example.com", "TestPass123")
+        client = self._proxied_client(preserve)
+        token, _ = self._login(client, f"proxy-logout-{preserve}@example.com")
+
+        response = client.post("/api/v1/auth/logout", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200
+        assert "X-Refreshed-Token" not in response.headers
+        set_cookies = response.headers.get_list("set-cookie")
+        assert len(set_cookies) == 1
+        assert 'invokeai_media_token=""' in set_cookies[0]
+        assert f"Path={self.BASE_PATH}/api/v1" in set_cookies[0]

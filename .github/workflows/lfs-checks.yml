@@ -1,0 +1,30 @@
+# Checks that large files and LFS-tracked files are properly checked in with pointer format.
+# Uses https://github.com/ppremk/lfs-warning to detect LFS issues.
+
+name: 'lfs checks'
+
+on:
+  push:
+    branches:
+      - 'main'
+  pull_request:
+    types:
+      - 'ready_for_review'
+      - 'opened'
+      - 'synchronize'
+  merge_group:
+  workflow_dispatch:
+
+jobs:
+  lfs-check:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    permissions:
+      # Required to label and comment on the PRs
+      pull-requests: write
+    steps:
+      - name: checkout
+        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+
+      - name: check lfs files
+        uses: ppremk/lfs-warning@4b98a8a5e6c429c23c34eee02d71553bca216425 # v3.3

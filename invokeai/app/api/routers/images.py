@@ -1,0 +1,1043 @@
+import asyncio
+import io
+import json
+import traceback
+from datetime import date
+from typing import Annotated, ClassVar, Optional
+
+from fastapi import BackgroundTasks, Body, HTTPException, Path, Query, Request, Response, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.routing import APIRouter
+from PIL import Image
+from pydantic import BaseModel, Field, StringConstraints, model_validator
+
+from invokeai.app.api.auth_dependencies import CurrentMediaUserOrDefault, CurrentUserOrDefault
+from invokeai.app.api.dependencies import ApiDependencies
+from invokeai.app.api.extract_metadata import extract_metadata_from_image
+from invokeai.app.api.routers._access import (
+    assert_board_read_access as _assert_board_read_access,
+)
+from invokeai.app.api.routers._access import (
+    assert_board_write_access as _assert_board_write_access,
+)
+from invokeai.app.api.routers._access import (
+    assert_image_action as _assert_image_action,
+)
+from invokeai.app.api.routers._access import (
+    assert_image_read_access as _assert_image_read_access,
+)
+from invokeai.app.api.routers._access import (
+    assert_project_owned,
+    item_action_for_changes,
+    redact_project_ids,
+)
+from invokeai.app.api.routers._limits import MAX_COPY_BATCH_SIZE
+from invokeai.app.api.routers.image_move_maintenance import assert_image_move_maintenance_inactive
+from invokeai.app.invocations.fields import MetadataField
+from invokeai.app.services.board_access.board_access_common import ItemAction
+from invokeai.app.services.image_records.image_records_common import (
+    ImageCategory,
+    ImageNamesResult,
+    ImageRecordChanges,
+    ImageRecordNotFoundException,
+    ResourceOrigin,
+    is_gallery_category,
+)
+from invokeai.app.services.images.images_common import (
+    DeleteImagesResult,
+    ImageDTO,
+    ImageUrlsDTO,
+    StarredImagesResult,
+    UnstarredImagesResult,
+)
+from invokeai.app.services.intermediates.intermediates_base import IntermediatesCaller
+from invokeai.app.services.shared.pagination import MAX_PAGE_SIZE, OffsetPaginatedResults, SQLiteDirection
+from invokeai.app.util.controlnet_utils import heuristic_resize_fast
+from invokeai.backend.image_util.util import np_to_pil, pil_to_np
+
+images_router = APIRouter(prefix="/v1/images", tags=["images"])
+
+
+# images are immutable; set a high max-age
+IMAGE_MAX_AGE = 31536000
+
+# Every name in a batch body costs at least one DB lookup, so an unbounded list lets an
+# authenticated client pin a worker with a single request. Mirrors MAX_VIDEO_BATCH_SIZE
+# in the videos router.
+#
+# "At least one" is doing real work in that sentence. The authorization helpers in _access.py
+# short-circuit for an admin (no query) and a direct owner (one), but a user acting on someone
+# else's item on a board they share costs three indexed reads per name: the item's owner, its
+# board, and that board's access facts. That is the case the bound has to hold, and it is why no
+# route gets a laxer one: the oversized selections this cap rejects are split client-side instead.
+MAX_IMAGE_BATCH_SIZE = 1000
+# Names are UUID-derived filenames; the bound only exists to keep a hostile body from
+# turning into megabytes of SQL parameters.
+ImageName = Annotated[str, StringConstraints(max_length=255)]
+
+
+def _get_image_cache_control() -> str:
+    if ApiDependencies.invoker.services.configuration.multiuser:
+        return "private, no-store"
+    return f"max-age={IMAGE_MAX_AGE}"
+
+
+class ResizeToDimensions(BaseModel):
+    width: int = Field(..., gt=0)
+    height: int = Field(..., gt=0)
+
+    MAX_SIZE: ClassVar[int] = 4096 * 4096
+
+    @model_validator(mode="after")
+    def validate_total_output_size(self):
+        if self.width * self.height > self.MAX_SIZE:
+            raise ValueError(f"Max total output size for resizing is {self.MAX_SIZE} pixels")
+        return self
+
+
+@images_router.post(
+    "/upload",
+    operation_id="upload_image",
+    responses={
+        201: {"description": "The image was uploaded successfully"},
+        415: {"description": "Image upload failed"},
+    },
+    status_code=201,
+    response_model=ImageDTO,
+)
+async def upload_image(
+    current_user: CurrentUserOrDefault,
+    file: UploadFile,
+    request: Request,
+    response: Response,
+    image_category: ImageCategory = Query(description="The category of the image"),
+    is_intermediate: bool = Query(description="Whether this is an intermediate image"),
+    board_id: Optional[str] = Query(default=None, description="The board to add this image to, if any"),
+    session_id: Optional[str] = Query(default=None, description="The session ID associated with this upload, if any"),
+    project_id: Optional[str] = Query(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description="The caller's project this upload originates in, if any; recorded for intermediates cleanup",
+    ),
+    crop_visible: Optional[bool] = Query(default=False, description="Whether to crop the image"),
+    resize_to: Optional[str] = Body(
+        default=None,
+        description=f"Dimensions to resize the image to, must be stringified tuple of 2 integers. Max total pixel count: {ResizeToDimensions.MAX_SIZE}",
+        examples=['"[1024,1024]"'],
+    ),
+    metadata: Optional[str] = Body(
+        default=None,
+        description="The metadata to associate with the image, must be a stringified JSON dict",
+        embed=True,
+    ),
+) -> ImageDTO:
+    """Uploads an image for the current user"""
+    await asyncio.to_thread(_assert_board_write_access, board_id, current_user)
+    await asyncio.to_thread(assert_project_owned, project_id, current_user)
+
+    await asyncio.to_thread(assert_image_move_maintenance_inactive)
+
+    if not file.content_type or not file.content_type.startswith("image"):
+        raise HTTPException(status_code=415, detail="Not an image")
+
+    contents = await file.read()
+    try:
+        pil_image = await asyncio.to_thread(Image.open, io.BytesIO(contents))
+    except Exception:
+        ApiDependencies.invoker.services.logger.error(traceback.format_exc())
+        raise HTTPException(status_code=415, detail="Failed to read image")
+
+    if crop_visible:
+        try:
+
+            def _crop() -> Image.Image:
+                return pil_image.crop(pil_image.getbbox())
+
+            pil_image = await asyncio.to_thread(_crop)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Failed to crop image")
+
+    if resize_to:
+        try:
+            dims = json.loads(resize_to)
+            resize_dims = ResizeToDimensions(**dims)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid resize_to format or size")
+
+        try:
+            # heuristic_resize_fast expects an RGB or RGBA image
+            def _resize() -> Image.Image:
+                pil_rgba = pil_image.convert("RGBA")
+                np_image = pil_to_np(pil_rgba)
+                resized_np_image = heuristic_resize_fast(np_image, (resize_dims.width, resize_dims.height))
+                return np_to_pil(resized_np_image)
+
+            pil_image = await asyncio.to_thread(_resize)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Failed to resize image")
+
+    extracted_metadata = await asyncio.to_thread(
+        extract_metadata_from_image,
+        pil_image=pil_image,
+        invokeai_metadata_override=metadata,
+        invokeai_workflow_override=None,
+        invokeai_graph_override=None,
+        logger=ApiDependencies.invoker.services.logger,
+    )
+
+    try:
+        image_dto = await asyncio.to_thread(
+            ApiDependencies.invoker.services.images.create,
+            image=pil_image,
+            image_origin=ResourceOrigin.EXTERNAL,
+            image_category=image_category,
+            session_id=session_id,
+            board_id=board_id,
+            metadata=extracted_metadata.invokeai_metadata,
+            workflow=extracted_metadata.invokeai_workflow,
+            graph=extracted_metadata.invokeai_graph,
+            is_intermediate=is_intermediate,
+            user_id=current_user.user_id,
+            project_id=project_id,
+        )
+    except Exception:
+        ApiDependencies.invoker.services.logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Failed to create image")
+
+    if not is_intermediate and is_gallery_category(image_category):
+        ApiDependencies.invoker.services.events.emit_image_uploaded(image_dto, user_id=current_user.user_id)
+
+    response.status_code = 201
+    response.headers["Location"] = image_dto.image_url
+
+    return image_dto
+
+
+class ImageUploadEntry(BaseModel):
+    image_dto: ImageDTO = Body(description="The image DTO")
+    presigned_url: str = Body(description="The URL to get the presigned URL for the image upload")
+
+
+@images_router.post("/", operation_id="create_image_upload_entry")
+def create_image_upload_entry(
+    _: CurrentUserOrDefault,
+    width: int = Body(description="The width of the image"),
+    height: int = Body(description="The height of the image"),
+    board_id: Optional[str] = Body(default=None, description="The board to add this image to, if any"),
+) -> ImageUploadEntry:
+    """Uploads an image from a URL, not implemented"""
+
+    raise HTTPException(status_code=501, detail="Not implemented")
+
+
+@images_router.delete("/i/{image_name}", operation_id="delete_image", response_model=DeleteImagesResult)
+def delete_image(
+    current_user: CurrentUserOrDefault,
+    image_name: str = Path(description="The name of the image to delete"),
+) -> DeleteImagesResult:
+    """Deletes an image"""
+    _assert_image_action(image_name, current_user, ItemAction.Delete)
+    assert_image_move_maintenance_inactive()
+
+    # Let service-level failures surface as errors rather than swallowing them and returning
+    # a success-shaped response. A previous version of this handler caught everything and
+    # returned an empty ``deleted_images`` list with HTTP 200; the frontend treated that as
+    # success and dropped the item from its cache even though the record was still live.
+    try:
+        image_dto = ApiDependencies.invoker.services.images.get_dto(image_name)
+    except ImageRecordNotFoundException:
+        raise HTTPException(status_code=404, detail="Image not found")
+    except Exception:
+        # A record/URL/board lookup failure for an image that does exist is a server fault, not a
+        # missing image — reporting it as 404 would tell the frontend to drop a live item.
+        raise HTTPException(status_code=500, detail="Failed to delete image")
+
+    board_id = image_dto.board_id or "none"
+    try:
+        ApiDependencies.invoker.services.images.delete(image_name)
+    except ImageRecordNotFoundException:
+        # Another request deleted the image between the lookup above and the service call. The
+        # image is gone, which is what the client asked for — answer as the lookup would have.
+        raise HTTPException(status_code=404, detail="Image not found")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to delete image")
+
+    return DeleteImagesResult(
+        deleted_images=[image_name],
+        # Every failure path above raises, so a returned result always describes a completed
+        # delete; nothing can land in ``failed_images``.
+        failed_images=[],
+        affected_boards=[board_id],
+    )
+
+
+@images_router.delete("/intermediates", operation_id="clear_intermediates")
+def clear_intermediates(
+    current_user: CurrentUserOrDefault,
+) -> int:
+    """Clears every safe intermediate image, instance-wide. Requires admin.
+
+    Runs under the same policy as the intermediates manager: images that active work, a saved
+    document or the recency window protect are kept. Videos are not touched; use the manager.
+    """
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only admins can clear all intermediates")
+    assert_image_move_maintenance_inactive()
+
+    try:
+        return ApiDependencies.invoker.services.intermediates.clear_all_images_now(
+            IntermediatesCaller(user_id=current_user.user_id, is_admin=current_user.is_admin)
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to clear intermediates")
+
+
+@images_router.get("/intermediates", operation_id="get_intermediates_count")
+def get_intermediates_count(
+    current_user: CurrentUserOrDefault,
+) -> int:
+    """Counts the intermediate images a clear would delete. Non-admin users only see their own intermediates.
+
+    Active, recent and referenced images are left out, as `DELETE /intermediates` keeps them.
+    """
+
+    try:
+        return ApiDependencies.invoker.services.intermediates.count_safe_images(
+            IntermediatesCaller(user_id=current_user.user_id, is_admin=current_user.is_admin)
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to get intermediates")
+
+
+@images_router.patch(
+    "/i/{image_name}",
+    operation_id="update_image",
+    response_model=ImageDTO,
+)
+def update_image(
+    current_user: CurrentUserOrDefault,
+    image_name: str = Path(description="The name of the image to update"),
+    image_changes: ImageRecordChanges = Body(description="The changes to apply to the image"),
+) -> ImageDTO:
+    """Updates an image"""
+    _assert_image_action(image_name, current_user, item_action_for_changes(image_changes))
+    assert_image_move_maintenance_inactive()
+
+    try:
+        image_dto = ApiDependencies.invoker.services.images.update(image_name, image_changes)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to update image")
+    # Starring is a board role's to do, so the caller may be a member reading another member's item.
+    redact_project_ids([image_dto], current_user)
+    return image_dto
+
+
+@images_router.get(
+    "/i/{image_name}",
+    operation_id="get_image_dto",
+    response_model=ImageDTO,
+)
+def get_image_dto(
+    current_user: CurrentUserOrDefault,
+    image_name: str = Path(description="The name of image to get"),
+) -> ImageDTO:
+    """Gets an image's DTO"""
+    _assert_image_read_access(image_name, current_user)
+
+    try:
+        image_dto = ApiDependencies.invoker.services.images.get_dto(image_name)
+    except ImageRecordNotFoundException:
+        # Only a genuinely missing record answers 404. This route is what a workflow's image
+        # field and a canvas reference image read, and they drop the user's reference when it
+        # 404s, so nothing else may wear that answer: a board lookup against an unreadable
+        # database, or a URL service failure, would otherwise clear a live image out of the
+        # workflows using it. Narrowed here rather than everywhere, because this is the 404
+        # that is acted on destructively — the media, metadata and workflow routes keep theirs.
+        raise HTTPException(status_code=404)
+    redact_project_ids([image_dto], current_user)
+    return image_dto
+
+
+@images_router.get(
+    "/i/{image_name}/metadata",
+    operation_id="get_image_metadata",
+    response_model=Optional[MetadataField],
+)
+def get_image_metadata(
+    current_user: CurrentUserOrDefault,
+    image_name: str = Path(description="The name of image to get"),
+) -> Optional[MetadataField]:
+    """Gets an image's metadata"""
+    _assert_image_read_access(image_name, current_user)
+
+    try:
+        return ApiDependencies.invoker.services.images.get_metadata(image_name)
+    except Exception:
+        raise HTTPException(status_code=404)
+
+
+class WorkflowAndGraphResponse(BaseModel):
+    workflow: Optional[str] = Field(description="The workflow used to generate the image, as stringified JSON")
+    graph: Optional[str] = Field(description="The graph used to generate the image, as stringified JSON")
+
+
+@images_router.get(
+    "/i/{image_name}/workflow", operation_id="get_image_workflow", response_model=WorkflowAndGraphResponse
+)
+def get_image_workflow(
+    current_user: CurrentUserOrDefault,
+    image_name: str = Path(description="The name of image whose workflow to get"),
+) -> WorkflowAndGraphResponse:
+    _assert_image_read_access(image_name, current_user)
+    assert_image_move_maintenance_inactive()
+
+    try:
+        workflow = ApiDependencies.invoker.services.images.get_workflow(image_name)
+        graph = ApiDependencies.invoker.services.images.get_graph(image_name)
+        return WorkflowAndGraphResponse(workflow=workflow, graph=graph)
+    except Exception:
+        raise HTTPException(status_code=404)
+
+
+@images_router.get(
+    "/i/{image_name}/full",
+    operation_id="get_image_full",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "Return the full-resolution image",
+            "content": {"image/png": {}},
+        },
+        404: {"description": "Image not found"},
+    },
+)
+@images_router.head(
+    "/i/{image_name}/full",
+    operation_id="get_image_full_head",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "Return the full-resolution image",
+            "content": {"image/png": {}},
+        },
+        404: {"description": "Image not found"},
+    },
+)
+def get_image_full(
+    current_user: CurrentMediaUserOrDefault,
+    image_name: str = Path(description="The name of full-resolution image file to get"),
+) -> Response:
+    """Gets a full-resolution image file.
+
+    Browser media requests authenticate with the path-scoped HttpOnly cookie set at login.
+    Returns 409 while image storage maintenance is active.
+    """
+    _assert_image_read_access(image_name, current_user)
+    assert_image_move_maintenance_inactive()
+
+    try:
+        path = ApiDependencies.invoker.services.images.get_path(image_name)
+        with open(path, "rb") as f:
+            content = f.read()
+        response = Response(content, media_type="image/png")
+        response.headers["Cache-Control"] = _get_image_cache_control()
+        response.headers["Content-Disposition"] = f'inline; filename="{image_name}"'
+        return response
+    except Exception:
+        raise HTTPException(status_code=404)
+
+
+@images_router.get(
+    "/i/{image_name}/thumbnail",
+    operation_id="get_image_thumbnail",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "Return the image thumbnail",
+            "content": {"image/webp": {}},
+        },
+        404: {"description": "Image not found"},
+    },
+)
+def get_image_thumbnail(
+    current_user: CurrentMediaUserOrDefault,
+    image_name: str = Path(description="The name of thumbnail image file to get"),
+) -> Response:
+    """Gets a thumbnail image file.
+
+    Browser media requests authenticate with the path-scoped HttpOnly cookie set at login.
+    Returns 409 while image storage maintenance is active.
+    """
+    _assert_image_read_access(image_name, current_user)
+    assert_image_move_maintenance_inactive()
+
+    try:
+        path = ApiDependencies.invoker.services.images.get_path(image_name, thumbnail=True)
+        with open(path, "rb") as f:
+            content = f.read()
+        response = Response(content, media_type="image/webp")
+        response.headers["Cache-Control"] = _get_image_cache_control()
+        return response
+    except Exception:
+        raise HTTPException(status_code=404)
+
+
+@images_router.get(
+    "/i/{image_name}/urls",
+    operation_id="get_image_urls",
+    response_model=ImageUrlsDTO,
+)
+def get_image_urls(
+    current_user: CurrentUserOrDefault,
+    image_name: str = Path(description="The name of the image whose URL to get"),
+) -> ImageUrlsDTO:
+    """Gets an image and thumbnail URL"""
+    _assert_image_read_access(image_name, current_user)
+
+    try:
+        image_url = ApiDependencies.invoker.services.images.get_url(image_name)
+        thumbnail_url = ApiDependencies.invoker.services.images.get_url(image_name, thumbnail=True)
+        return ImageUrlsDTO(
+            image_name=image_name,
+            image_url=image_url,
+            thumbnail_url=thumbnail_url,
+        )
+    except Exception:
+        raise HTTPException(status_code=404)
+
+
+@images_router.get(
+    "/",
+    operation_id="list_image_dtos",
+    response_model=OffsetPaginatedResults[ImageDTO],
+)
+def list_image_dtos(
+    current_user: CurrentUserOrDefault,
+    image_origin: Optional[ResourceOrigin] = Query(default=None, description="The origin of images to list."),
+    categories: Optional[list[ImageCategory]] = Query(default=None, description="The categories of image to include."),
+    is_intermediate: Optional[bool] = Query(default=None, description="Whether to list intermediate images."),
+    board_id: Optional[str] = Query(
+        default=None,
+        description=(
+            "The board id to filter by. Use 'none' for the current user's uncategorized images or 'all' for "
+            "images on every readable, non-archived board plus authorized uncategorized images. If omitted, "
+            "non-admin results remain limited to images owned by the current user."
+        ),
+    ),
+    # Bounds matter: these flow verbatim into SQL, and a negative LIMIT means *unlimited*
+    # in SQLite — one request would materialize every image row into a DTO. The lower
+    # bound on `limit` is 0, not 1: the frontend issues limit=0 count-only queries.
+    offset: int = Query(default=0, ge=0, description="The page offset"),
+    limit: int = Query(default=10, ge=0, le=MAX_PAGE_SIZE, description="The number of images per page"),
+    order_dir: SQLiteDirection = Query(default=SQLiteDirection.Descending, description="The order of sort"),
+    starred_first: bool = Query(default=True, description="Whether to sort by starred images first"),
+    search_term: Optional[str] = Query(default=None, description="The term to search for"),
+    created_from: Optional[date] = Query(
+        default=None, description="Inclusive start date (YYYY-MM-DD) to filter by created_at."
+    ),
+    created_to: Optional[date] = Query(
+        default=None, description="Inclusive end date (YYYY-MM-DD) to filter by created_at."
+    ),
+) -> OffsetPaginatedResults[ImageDTO]:
+    """Gets a list of image DTOs for the current user"""
+
+    # Validate that the caller can read from this board before listing its images.
+    # "none" and "all" are sentinels handled by the SQL layer.
+    if board_id is not None and board_id not in {"none", "all"}:
+        _assert_board_read_access(board_id, current_user)
+
+    image_dtos = ApiDependencies.invoker.services.images.get_many(
+        offset=offset,
+        limit=limit,
+        starred_first=starred_first,
+        order_dir=order_dir,
+        image_origin=image_origin,
+        categories=categories,
+        is_intermediate=is_intermediate,
+        board_id=board_id,
+        search_term=search_term,
+        created_from=created_from.isoformat() if created_from else None,
+        created_to=created_to.isoformat() if created_to else None,
+        user_id=current_user.user_id,
+        is_admin=current_user.is_admin,
+    )
+    redact_project_ids(image_dtos.items, current_user)
+
+    return image_dtos
+
+
+@images_router.post("/delete", operation_id="delete_images_from_list", response_model=DeleteImagesResult)
+def delete_images_from_list(
+    current_user: CurrentUserOrDefault,
+    image_names: list[ImageName] = Body(
+        description="The list of names of images to delete", embed=True, max_length=MAX_IMAGE_BATCH_SIZE
+    ),
+) -> DeleteImagesResult:
+    try:
+        assert_image_move_maintenance_inactive()
+    except HTTPException:
+        for image_name in image_names:
+            _assert_image_action(image_name, current_user, ItemAction.Delete)
+        raise
+
+    try:
+        # Skip — but do not re-raise — auth failures so a foreign name mid-batch doesn't
+        # discard the response payload for items the caller had already legitimately deleted.
+        # Without this, the client cache never learns about the partial successes and the
+        # already-deleted records reappear in the UI until the next full refresh.
+        deleted_images: set[str] = set()
+        failed_images: set[str] = set()
+        affected_boards: set[str] = set()
+        # Dedup while preserving order: a name repeated in the request would otherwise
+        # be processed twice, and the second pass's not-found error would land the same
+        # name in both deleted_images and failed_images.
+        for image_name in dict.fromkeys(image_names):
+            # Bound only once the record has been read, which is what separates the two ways
+            # this loop can raise ImageRecordNotFoundException. Still None means the read itself
+            # failed, so nothing here ever established that the record existed — for an admin
+            # the ownership check is a no-op returning before it touches storage, so a name that
+            # never existed reaches that raise. Set means the record was read a line earlier and
+            # only the delete lost the race.
+            board_id: str | None = None
+            try:
+                _assert_image_action(image_name, current_user, ItemAction.Delete)
+                image_dto = ApiDependencies.invoker.services.images.get_dto(image_name)
+                board_id = image_dto.board_id or "none"
+                ApiDependencies.invoker.services.images.delete(image_name)
+                deleted_images.add(image_name)
+                affected_boards.add(board_id)
+            except HTTPException:
+                continue
+            except ImageRecordNotFoundException:
+                if board_id is None:
+                    # Never read, so there is no postcondition the caller asked for and nothing
+                    # for the client to clean up. A skip, as before.
+                    continue
+                # The record is already gone — a concurrent session deleted it after this
+                # iteration read it. The caller asked for it to be gone and it is, so report the
+                # idempotently satisfied postcondition. The client uses deleted_images to remove
+                # stale selections and references. The board is reported with it: every
+                # board-scoped tag getDeleteImagesTags publishes comes from affected_boards, and
+                # it ignores deleted_images by design, so omitting it leaves the board's counts
+                # stale while the name is reported gone.
+                deleted_images.add(image_name)
+                affected_boards.add(board_id)
+                #
+                # Deliberately unlike remove_images_from_board, which skips the same race. Two
+                # reasons it cannot copy this. Its result list feeds
+                # getTagsToInvalidateForImageMutation, so a vanished name there would invalidate
+                # getImageDTO for a record that no longer exists and drive a 404 refetch —
+                # getDeleteImagesTags ignores deleted_images precisely to avoid that. And it
+                # reads the DTO *before* any authorization check, so reporting a 404 as success
+                # would answer for names the caller was never entitled to touch.
+                #
+                # This is narrow only because image_records.get() no longer translates a
+                # sqlite3.Error into this exception — see the comment there. If that
+                # translation ever comes back, a locked or corrupt database would land here
+                # and a whole failed batch would answer 200 with empty result lists.
+            except Exception:
+                # A genuine deletion failure (not an auth/404 skip) — report it so the
+                # client can surface a partial-failure warning, matching the video path.
+                failed_images.add(image_name)
+        return DeleteImagesResult(
+            deleted_images=list(deleted_images),
+            failed_images=list(failed_images),
+            affected_boards=list(affected_boards),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to delete images")
+
+
+@images_router.delete("/uncategorized", operation_id="delete_uncategorized_images", response_model=DeleteImagesResult)
+def delete_uncategorized_images(
+    current_user: CurrentUserOrDefault,
+) -> DeleteImagesResult:
+    """Deletes all uncategorized images owned by the current user (or all if admin)"""
+    assert_image_move_maintenance_inactive()
+
+    image_names = ApiDependencies.invoker.services.board_images.get_all_board_image_names_for_board(
+        board_id="none", categories=None, is_intermediate=None
+    )
+
+    try:
+        deleted_images: set[str] = set()
+        failed_images: set[str] = set()
+        affected_boards: set[str] = set()
+        for image_name in image_names:
+            try:
+                _assert_image_action(image_name, current_user, ItemAction.Delete)
+                ApiDependencies.invoker.services.images.delete(image_name)
+                deleted_images.add(image_name)
+                affected_boards.add("none")
+            except HTTPException:
+                # Skip images not owned by the current user
+                pass
+            except Exception:
+                failed_images.add(image_name)
+        return DeleteImagesResult(
+            deleted_images=list(deleted_images),
+            failed_images=list(failed_images),
+            affected_boards=list(affected_boards),
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to delete images")
+
+
+class CopiedImage(BaseModel):
+    source_image_name: str = Field(description="The image that was copied")
+    image_name: str = Field(description="The name assigned to the copy")
+
+
+class CopyImagesResult(BaseModel):
+    copied: list[CopiedImage] = Field(description="The copies that were made, in request order")
+    failed: list[str] = Field(description="The source image names that could not be copied")
+
+
+@images_router.post("/copy", operation_id="copy_images_to_board", response_model=CopyImagesResult)
+def copy_images_to_board(
+    current_user: CurrentUserOrDefault,
+    image_names: list[ImageName] = Body(description="The names of the images to copy", max_length=MAX_COPY_BATCH_SIZE),
+    board_id: Optional[str] = Body(default=None, description="The board to put the copies on, if any"),
+) -> CopyImagesResult:
+    """Copies images, optionally onto a board, and returns the new names.
+
+    Each copy is a genuinely new image with its own name, because `board_images` keys on
+    `image_name` — one image can sit on exactly one board, so sharing a name between two boards is
+    not representable. Duplicating a project needs that: its copy must own its media outright.
+
+    The pixels never leave the server, and never leave the disk either: `images.copy` clones the
+    record and copies the file byte for byte, so the embedded metadata, workflow and graph travel
+    without being parsed and rewritten. Category and origin travel; the originating session and
+    node do not. Starring is not copied — callers that want it use `POST /images/star`, the same
+    path an import uses.
+
+    Per-image failures are reported rather than raised, so one unreadable source cannot cost the
+    caller the whole batch.
+
+    A sync `def`, so FastAPI runs the batch on its threadpool: file copies are blocking, and a
+    board's worth of them on the event loop would stall every other request for the duration.
+
+    Read access is enough to copy, which means an image on a board shared with you can be copied
+    into something you own, and the copy outlives the share. That is deliberate — it is what makes
+    a shared board usable as a source — but it is a real widening of what "read-only" means, so it
+    is stated rather than left to be discovered.
+    """
+    _assert_board_write_access(board_id, current_user)
+    assert_image_move_maintenance_inactive()
+
+    copied: list[CopiedImage] = []
+    failed: list[str] = []
+
+    for image_name in image_names:
+        try:
+            _assert_image_read_access(image_name, current_user)
+            image_dto = ApiDependencies.invoker.services.images.copy(
+                source_image_name=image_name,
+                board_id=board_id,
+                user_id=current_user.user_id,
+            )
+            copied.append(CopiedImage(source_image_name=image_name, image_name=image_dto.image_name))
+        except Exception:
+            ApiDependencies.invoker.services.logger.error(f"Failed to copy image {image_name}", exc_info=True)
+            failed.append(image_name)
+
+    return CopyImagesResult(copied=copied, failed=failed)
+
+
+class ImagesUpdatedFromListResult(BaseModel):
+    updated_image_names: list[str] = Field(description="The image names that were updated")
+
+
+@images_router.post("/star", operation_id="star_images_in_list", response_model=StarredImagesResult)
+def star_images_in_list(
+    current_user: CurrentUserOrDefault,
+    image_names: list[ImageName] = Body(
+        description="The list of names of images to star", embed=True, max_length=MAX_IMAGE_BATCH_SIZE
+    ),
+) -> StarredImagesResult:
+    try:
+        assert_image_move_maintenance_inactive()
+    except HTTPException:
+        for image_name in image_names:
+            _assert_image_action(image_name, current_user, ItemAction.Star)
+        raise
+
+    try:
+        # Skip — but do not re-raise — auth failures so a foreign name mid-batch doesn't
+        # discard the response payload for images that were already starred. Re-raising
+        # turned partial successes into an error-shaped response, so the client never
+        # invalidated caches for the images that did change and the UI showed them
+        # unstarred until the next full refresh. Matches delete_images_from_list and the
+        # video star/unstar routes.
+        starred_images: set[str] = set()
+        failed_images: set[str] = set()
+        affected_boards: set[str] = set()
+        # Dedup while preserving order — a repeated name would otherwise be processed
+        # twice and could land in both starred_images and failed_images.
+        for image_name in dict.fromkeys(image_names):
+            try:
+                _assert_image_action(image_name, current_user, ItemAction.Star)
+                updated_image_dto = ApiDependencies.invoker.services.images.update(
+                    image_name, changes=ImageRecordChanges(starred=True)
+                )
+                starred_images.add(image_name)
+                affected_boards.add(updated_image_dto.board_id or "none")
+            except HTTPException:
+                continue
+            except ImageRecordNotFoundException:
+                # Deleted by a concurrent session — a skip, not a storage failure. See
+                # delete_images_from_list. Reachable here through the get_dto read-back inside
+                # ImageService.update: the UPDATE itself matches no row and raises nothing, so
+                # a name that vanished mid-batch surfaces only on the read that follows.
+                continue
+            except Exception:
+                # A genuine storage failure, not an auth/404 skip: it used to be swallowed
+                # by `pass`, so the client counted the image as starred and the star
+                # silently vanished on reload.
+                failed_images.add(image_name)
+        return StarredImagesResult(
+            starred_images=list(starred_images),
+            failed_images=list(failed_images),
+            affected_boards=list(affected_boards),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to star images")
+
+
+@images_router.post("/unstar", operation_id="unstar_images_in_list", response_model=UnstarredImagesResult)
+def unstar_images_in_list(
+    current_user: CurrentUserOrDefault,
+    image_names: list[ImageName] = Body(
+        description="The list of names of images to unstar", embed=True, max_length=MAX_IMAGE_BATCH_SIZE
+    ),
+) -> UnstarredImagesResult:
+    try:
+        assert_image_move_maintenance_inactive()
+    except HTTPException:
+        for image_name in image_names:
+            _assert_image_action(image_name, current_user, ItemAction.Star)
+        raise
+
+    try:
+        # See star_images_in_list: skip foreign names instead of re-raising mid-batch, and
+        # report genuine storage failures instead of swallowing them.
+        unstarred_images: set[str] = set()
+        failed_images: set[str] = set()
+        affected_boards: set[str] = set()
+        for image_name in dict.fromkeys(image_names):
+            try:
+                _assert_image_action(image_name, current_user, ItemAction.Star)
+                updated_image_dto = ApiDependencies.invoker.services.images.update(
+                    image_name, changes=ImageRecordChanges(starred=False)
+                )
+                unstarred_images.add(image_name)
+                affected_boards.add(updated_image_dto.board_id or "none")
+            except HTTPException:
+                continue
+            except ImageRecordNotFoundException:
+                # See star_images_in_list.
+                continue
+            except Exception:
+                failed_images.add(image_name)
+        return UnstarredImagesResult(
+            unstarred_images=list(unstarred_images),
+            failed_images=list(failed_images),
+            affected_boards=list(affected_boards),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to unstar images")
+
+
+class ImagesDownloaded(BaseModel):
+    response: Optional[str] = Field(
+        default=None, description="The message to display to the user when images begin downloading"
+    )
+    bulk_download_item_name: Optional[str] = Field(
+        default=None, description="The name of the bulk download item for which events will be emitted"
+    )
+
+
+@images_router.post(
+    "/download", operation_id="download_images_from_list", response_model=ImagesDownloaded, status_code=202
+)
+def download_images_from_list(
+    current_user: CurrentUserOrDefault,
+    background_tasks: BackgroundTasks,
+    image_names: Optional[list[ImageName]] = Body(
+        default=None,
+        description="The list of names of images to download",
+        embed=True,
+        max_length=MAX_IMAGE_BATCH_SIZE,
+    ),
+    board_id: Optional[str] = Body(
+        default=None, description="The board from which image should be downloaded", embed=True
+    ),
+) -> ImagesDownloaded:
+    if (image_names is None or len(image_names) == 0) and board_id is None:
+        raise HTTPException(status_code=400, detail="No images or board id specified.")
+
+    # Validate that the caller can read every image they are requesting.
+    # For a board_id request, check board visibility; for explicit image names,
+    # check each image individually.
+    if board_id:
+        _assert_board_read_access(board_id, current_user)
+    if image_names:
+        for name in image_names:
+            _assert_image_read_access(name, current_user)
+
+    assert_image_move_maintenance_inactive()
+
+    bulk_download_item_id: str = ApiDependencies.invoker.services.bulk_download.generate_item_id(board_id)
+
+    background_tasks.add_task(
+        ApiDependencies.invoker.services.bulk_download.handler,
+        image_names,
+        board_id,
+        bulk_download_item_id,
+        current_user.user_id,
+    )
+    return ImagesDownloaded(bulk_download_item_name=bulk_download_item_id + ".zip")
+
+
+@images_router.api_route(
+    "/download/{bulk_download_item_name}",
+    methods=["GET"],
+    operation_id="get_bulk_download_item",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "Return the complete bulk download item",
+            "content": {"application/zip": {}},
+        },
+        404: {"description": "Image not found"},
+    },
+)
+def get_bulk_download_item(
+    current_user: CurrentUserOrDefault,
+    background_tasks: BackgroundTasks,
+    bulk_download_item_name: str = Path(description="The bulk_download_item_name of the bulk download item to get"),
+) -> FileResponse:
+    """Gets a bulk download zip file.
+
+    Requires authentication.  The caller must be the user who initiated the
+    download (tracked by the bulk download service) or an admin.
+    """
+    try:
+        # Verify the caller owns this download (or is an admin)
+        owner = ApiDependencies.invoker.services.bulk_download.get_owner(bulk_download_item_name)
+        if owner is not None and owner != current_user.user_id and not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="Not authorized to access this download")
+
+        path = ApiDependencies.invoker.services.bulk_download.get_path(bulk_download_item_name)
+
+        response = FileResponse(
+            path,
+            media_type="application/zip",
+            filename=bulk_download_item_name,
+            content_disposition_type="inline",
+        )
+        response.headers["Cache-Control"] = f"max-age={IMAGE_MAX_AGE}"
+        background_tasks.add_task(ApiDependencies.invoker.services.bulk_download.delete, bulk_download_item_name)
+        return response
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=404)
+
+
+@images_router.get("/names", operation_id="get_image_names", deprecated=True)
+def get_image_names(
+    current_user: CurrentUserOrDefault,
+    image_origin: Optional[ResourceOrigin] = Query(default=None, description="The origin of images to list."),
+    categories: Optional[list[ImageCategory]] = Query(default=None, description="The categories of image to include."),
+    is_intermediate: Optional[bool] = Query(default=None, description="Whether to list intermediate images."),
+    board_id: Optional[str] = Query(
+        default=None,
+        description=(
+            "The board id to filter by. Use 'none' for the current user's uncategorized images or 'all' for "
+            "images on every readable, non-archived board plus authorized uncategorized images. If omitted, "
+            "non-admin results remain limited to images owned by the current user."
+        ),
+    ),
+    order_dir: SQLiteDirection = Query(default=SQLiteDirection.Descending, description="The order of sort"),
+    starred_first: bool = Query(default=True, description="Whether to sort by starred images first"),
+    search_term: Optional[str] = Query(default=None, description="The term to search for"),
+    created_from: Optional[date] = Query(
+        default=None, description="Inclusive start date (YYYY-MM-DD) to filter by created_at."
+    ),
+    created_to: Optional[date] = Query(
+        default=None, description="Inclusive end date (YYYY-MM-DD) to filter by created_at."
+    ),
+) -> ImageNamesResult:
+    """Gets ordered list of image names with metadata for optimistic updates.
+
+    Deprecated: use `GET /v1/gallery/item_names`, which returns images and videos interleaved
+    in one ordered list. This image-only endpoint predates the polymorphic gallery.
+    """
+
+    # Validate that the caller can read from this board before listing its images.
+    if board_id is not None and board_id not in {"none", "all"}:
+        _assert_board_read_access(board_id, current_user)
+
+    try:
+        result = ApiDependencies.invoker.services.images.get_image_names(
+            starred_first=starred_first,
+            order_dir=order_dir,
+            image_origin=image_origin,
+            categories=categories,
+            is_intermediate=is_intermediate,
+            board_id=board_id,
+            search_term=search_term,
+            created_from=created_from.isoformat() if created_from else None,
+            created_to=created_to.isoformat() if created_to else None,
+            user_id=current_user.user_id,
+            is_admin=current_user.is_admin,
+        )
+        return result
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to get image names")
+
+
+@images_router.post(
+    "/images_by_names",
+    operation_id="get_images_by_names",
+    responses={200: {"model": list[ImageDTO]}},
+)
+def get_images_by_names(
+    current_user: CurrentUserOrDefault,
+    image_names: list[ImageName] = Body(
+        embed=True,
+        description="Object containing list of image names to fetch DTOs for",
+        max_length=MAX_IMAGE_BATCH_SIZE,
+    ),
+) -> list[ImageDTO]:
+    """Gets image DTOs for the specified image names. Maintains order of input names."""
+
+    try:
+        image_service = ApiDependencies.invoker.services.images
+
+        # Fetch DTOs preserving the order of requested names
+        image_dtos: list[ImageDTO] = []
+        for name in image_names:
+            try:
+                _assert_image_read_access(name, current_user)
+                dto = image_service.get_dto(name)
+                image_dtos.append(dto)
+            except HTTPException:
+                # Skip images the user is not authorized to view
+                continue
+            except Exception:
+                # Skip missing images - they may have been deleted between name fetch and DTO fetch
+                continue
+
+        redact_project_ids(image_dtos, current_user)
+        return image_dtos
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to get image DTOs")

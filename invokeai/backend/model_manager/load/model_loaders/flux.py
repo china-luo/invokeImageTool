@@ -1,0 +1,2430 @@
+"""Class for Flux model loading in InvokeAI."""
+
+from pathlib import Path
+from typing import Any, Optional
+
+import accelerate
+import torch
+from diffusers import AutoencoderKL
+from safetensors.torch import load_file
+from transformers import (
+    AutoConfig,
+    AutoModelForTextEncoding,
+    CLIPTextModel,
+    CLIPTextModelWithProjection,
+    CLIPTokenizer,
+    T5EncoderModel,
+    T5Tokenizer,
+)
+
+from invokeai.app.services.config.config_default import get_config
+from invokeai.backend.clip.clip_text_encoder import clip_text_config, load_bundled_clip_tokenizer
+from invokeai.backend.flux.controlnet.instantx_controlnet_flux import InstantXControlNetFlux
+from invokeai.backend.flux.controlnet.state_dict_utils import (
+    convert_diffusers_instantx_state_dict_to_bfl_format,
+    infer_flux_params_from_state_dict,
+    infer_instantx_num_control_modes_from_state_dict,
+    is_state_dict_instantx_controlnet,
+    is_state_dict_xlabs_controlnet,
+)
+from invokeai.backend.flux.controlnet.xlabs_controlnet_flux import XLabsControlNetFlux
+from invokeai.backend.flux.ip_adapter.state_dict_utils import infer_xlabs_ip_adapter_params_from_state_dict
+from invokeai.backend.flux.ip_adapter.xlabs_ip_adapter_flux import (
+    XlabsIpAdapterFlux,
+)
+from invokeai.backend.flux.model import Flux
+from invokeai.backend.flux.redux.flux_redux_model import FluxReduxModel
+from invokeai.backend.flux.util import get_flux_transformers_params, get_flux_vae_diffusers_config
+from invokeai.backend.model_manager.checkpoint_prefix import CheckpointPrefix
+from invokeai.backend.model_manager.configs.base import Checkpoint_Config_Base, Diffusers_Config_Base
+from invokeai.backend.model_manager.configs.clip_embed import (
+    CLIPEmbed_Checkpoint_Config_Base,
+    CLIPEmbed_Diffusers_Config_Base,
+)
+from invokeai.backend.model_manager.configs.controlnet import (
+    ControlNet_Checkpoint_Config_Base,
+    ControlNet_Diffusers_Config_Base,
+)
+from invokeai.backend.model_manager.configs.factory import AnyModelConfig
+from invokeai.backend.model_manager.configs.flux_redux import FLUXRedux_Checkpoint_Config
+from invokeai.backend.model_manager.configs.ip_adapter import IPAdapter_Checkpoint_Config_Base
+from invokeai.backend.model_manager.configs.main import (
+    Main_BnBNF4_FLUX_Config,
+    Main_Checkpoint_Flux2_Config,
+    Main_Checkpoint_FLUX_Config,
+    Main_GGUF_Flux2_Config,
+    Main_GGUF_FLUX_Config,
+    Main_SDNQ_Diffusers_Flux2_Config,
+    Main_SDNQ_Diffusers_FLUX_Config,
+    Main_SDNQ_Flux2_Config,
+    Main_SDNQ_FLUX_Config,
+)
+from invokeai.backend.model_manager.configs.t5_encoder import (
+    T5Encoder_BnBLLMint8_Config,
+    T5Encoder_GGUF_Config,
+    T5Encoder_SDNQ_Config,
+    T5Encoder_T5Encoder_Config,
+)
+from invokeai.backend.model_manager.configs.vae import VAE_Checkpoint_Config_Base, VAE_Checkpoint_Flux2_Config
+from invokeai.backend.model_manager.load.fp8_capability import Unimplemented
+from invokeai.backend.model_manager.load.load_default import (
+    ModelLoader,
+    _model_declared_skip_patterns,
+    resolve_submodel_path,
+)
+from invokeai.backend.model_manager.load.model_loader_registry import ModelLoaderRegistry
+from invokeai.backend.model_manager.load.model_loaders.flux2_state_dict_utils import (
+    convert_flux2_bfl_to_diffusers,
+    convert_flux2_vae_bfl_to_diffusers,
+)
+from invokeai.backend.model_manager.load.model_loaders.generic_diffusers import GenericDiffusersLoader
+from invokeai.backend.model_manager.taxonomy import (
+    AnyModel,
+    BaseModelType,
+    ClipVariantType,
+    FluxVariantType,
+    ModelFormat,
+    ModelType,
+    SubModelType,
+)
+from invokeai.backend.model_manager.util.model_util import (
+    convert_bundle_to_flux_transformer_checkpoint,
+)
+from invokeai.backend.quantization.fp8_scaled import (
+    Fp8ScaledLayer,
+    attach_fp8_scales,
+    can_stay_quantized,
+    cast_state_dict,
+    dequantize_fp8_scaled,
+    expand_weight_scale,
+    extract_comfy_quant_hints,
+    extract_fp8_scaled_layers,
+    full_precision_hints_respected,
+    is_scale_metadata_key,
+    iter_weight_scale_pairs,
+    parse_quantization_metadata,
+    read_safetensors_metadata,
+    reject_quantized_side_channel,
+    split_fp8_scaled_layers,
+    strip_layer_path_prefix,
+    warn_on_unattached_scales,
+)
+from invokeai.backend.quantization.gguf.loaders import gguf_sd_loader
+from invokeai.backend.quantization.gguf.utils import TORCH_COMPATIBLE_QTYPES
+from invokeai.backend.quantization.int8_convrot import (
+    INT8_TENSORWISE_FORMAT,
+    Int8ConvrotLinear,
+    drop_unconsumed_quantization_sidecars,
+    extract_int8_convrot_markers,
+    install_int8_convrot_layers,
+    reject_unmarked_int8_weights,
+)
+from invokeai.backend.quantization.load_plan import reserve_for_load
+from invokeai.backend.quantization.sdnq.detection import is_sdnq_folder
+from invokeai.backend.quantization.sdnq.loaders import raise_on_incomplete_sdnq_load, sdnq_sd_loader
+from invokeai.backend.util.logging import InvokeAILogger
+from invokeai.backend.util.silence_warnings import SilenceWarnings
+from invokeai.backend.util.state_dict_loading import load_state_dict_ignoring_extras
+
+logger = InvokeAILogger.get_logger(__name__)
+
+
+try:
+    from invokeai.backend.quantization.bnb_llm_int8 import quantize_model_llm_int8
+    from invokeai.backend.quantization.bnb_nf4 import quantize_model_nf4
+
+    bnb_available = True
+except ImportError:
+    bnb_available = False
+
+app_config = get_config()
+
+
+# A key that exists only in the BFL layout -- structural on purpose, because
+# `encoder.conv_in.weight` is present in every layout and in every 16-channel autoencoder.
+_FLUX_VAE_BFL_MARKER = "encoder.down.0.block.0.norm1.weight"
+
+# ...and the diffusers-layout key, which is recognised only in order to be *refused* with a reason.
+# See `FluxVAELoader` for why accepting it would be unsafe.
+_FLUX_VAE_DIFFUSERS_MARKER = "encoder.down_blocks.0.resnets.0.norm1.weight"
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux, type=ModelType.VAE, format=ModelFormat.Checkpoint)
+class FluxVAELoader(ModelLoader):
+    """Load the FLUX.1 autoencoder as a diffusers `AutoencoderKL`.
+
+    This is the same network either way: loaded into InvokeAI's own port of the BFL reference and
+    into `AutoencoderKL`, the two agree in fp32 to `maxdiff 1.6e-06` on a latent and `1.5e-05` on an
+    image, which is float accumulation noise. The diffusers class is used because it brings a tiled
+    *encode*, which the port never had -- an untiled 3072px encode reserves 18.8 GiB on a 4090
+    against 0.81 GiB tiled, and does not complete at all on a 16 GiB card.
+
+    **Only the BFL `ae.safetensors` layout is accepted, and that is deliberate.**
+
+    The SD 3.5 and CogView 4 autoencoders are architecturally identical to this one: same 244 keys,
+    same shapes, differing only in `scaling_factor`/`shift_factor` (1.5305/0.0609 and 1.0/0.0 against
+    0.3611/0.1159). A single file carries only the weights, so identification files a 16-channel
+    checkpoint under `flux` unless its name or an explicit `base` says SD3 -- which means `flux` can be
+    no more than the default for a file that names nothing, and CogView 4 has no branch at all.
+
+    A standalone diffusers-layout file carries no config, so loading one would mean stamping FLUX's
+    constants onto weights that may be SD 3.5's -- which loads cleanly, generates without error, and
+    produces a wrongly normalised image that nothing downstream can tell from an intended one.
+    `is_flux_family_vae` cannot catch it either, because it reads the config this loader synthesised.
+    The BFL layout has no such ambiguity: its key names belong to the BFL reference implementation
+    and neither of the others is published in it.
+
+    So a diffusers-layout single file is refused, as it was before this loader could read that layout
+    at all. The unambiguous route for one still works: install the `vae/` folder, which carries its
+    own `config.json`, is identified from it, and loads through the generic `VAELoader`.
+    """
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        from diffusers.loaders.single_file_utils import convert_ldm_vae_checkpoint
+
+        if not isinstance(config, VAE_Checkpoint_Config_Base):
+            raise ValueError("Only VAECheckpointConfig models are currently supported here.")
+        model_path = Path(config.path)
+
+        sd = load_file(model_path)
+
+        with accelerate.init_empty_weights():
+            model = AutoencoderKL(**get_flux_vae_diffusers_config())
+
+        if _FLUX_VAE_BFL_MARKER in sd:
+            payload = convert_ldm_vae_checkpoint(sd, model.config)
+        elif _FLUX_VAE_DIFFUSERS_MARKER in sd:
+            raise ValueError(
+                f"{model_path.name} is a diffusers-layout autoencoder. A standalone file in that "
+                "layout carries no config, and the FLUX.1, SD 3.5 and CogView 4 autoencoders are "
+                "identical in shape -- so which latent space this one encodes into cannot be "
+                "determined from the file, and guessing wrong produces images that look plausible "
+                "and are not. Install the VAE's folder instead, which carries its own config.json."
+            )
+        else:
+            raise ValueError(f"{model_path.name} is not a FLUX.1 autoencoder: it has no '{_FLUX_VAE_BFL_MARKER}'.")
+
+        load_state_dict_ignoring_extras(model, payload, source="FLUX VAE checkpoint", assign=True)
+        model.to(self._torch_dtype_avoiding_float16())
+
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux2, type=ModelType.VAE, format=ModelFormat.Diffusers)
+class Flux2VAEDiffusersLoader(ModelLoader):
+    """Class to load FLUX.2 VAE models in diffusers format (AutoencoderKLFlux2 with 32 latent channels)."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        from diffusers import AutoencoderKLFlux2
+
+        model_path = Path(config.path)
+
+        vae_dtype = self._torch_dtype_avoiding_float16()
+
+        model = AutoencoderKLFlux2.from_pretrained(
+            model_path,
+            torch_dtype=vae_dtype,
+            local_files_only=True,
+        )
+
+        model = self._apply_fp8_layerwise_casting(model, config, submodel_type)
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux2, type=ModelType.VAE, format=ModelFormat.Checkpoint)
+class Flux2VAELoader(ModelLoader):
+    """Class to load FLUX.2 VAE models (AutoencoderKLFlux2 with 32 latent channels)."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, VAE_Checkpoint_Flux2_Config):
+            raise ValueError("Only VAE_Checkpoint_Flux2_Config models are currently supported here.")
+
+        from diffusers import AutoencoderKLFlux2
+
+        model_path = Path(config.path)
+
+        # Load state dict manually since from_single_file may not support AutoencoderKLFlux2 yet
+        sd = load_file(model_path)
+        reject_quantized_side_channel(sd, f"FLUX.2 VAE checkpoint {model_path.name}")
+
+        # Convert BFL format to diffusers format if needed
+        # BFL format uses: encoder.down., decoder.up., decoder.mid.block_1, decoder.mid.attn_1, decoder.norm_out
+        # Diffusers uses: encoder.down_blocks., decoder.up_blocks., decoder.mid_block.resnets., decoder.conv_norm_out
+        is_bfl_format = any(
+            k.startswith("encoder.down.")
+            or k.startswith("decoder.up.")
+            or k.startswith("decoder.mid.block_")
+            or k.startswith("decoder.mid.attn_")
+            or k.startswith("decoder.norm_out")
+            or k.startswith("encoder.mid.block_")
+            or k.startswith("encoder.mid.attn_")
+            or k.startswith("encoder.norm_out")
+            for k in sd.keys()
+        )
+        if is_bfl_format:
+            sd = convert_flux2_vae_bfl_to_diffusers(sd)
+
+        # FLUX.2 VAE configuration (32 latent channels).
+        # The standard FLUX.2 VAE uses block_out_channels=(128,256,512,512) for both
+        # encoder and decoder. The "small decoder" variant from
+        # black-forest-labs/FLUX.2-small-decoder keeps the full encoder but uses a
+        # narrower decoder with channels (96,192,384,384). AutoencoderKLFlux2 only
+        # exposes a single block_out_channels, so we build the model with the
+        # encoder's channels and, if the decoder differs, replace just the decoder
+        # submodule with a matching one before loading the state dict.
+        encoder_block_out_channels = (128, 256, 512, 512)
+        decoder_block_out_channels = encoder_block_out_channels
+        if "encoder.conv_in.weight" in sd and "encoder.conv_norm_out.weight" in sd:
+            enc_last = int(sd["encoder.conv_norm_out.weight"].shape[0])
+            enc_first = int(sd["encoder.conv_in.weight"].shape[0])
+            encoder_block_out_channels = (enc_first, enc_first * 2, enc_last, enc_last)
+        if "decoder.conv_in.weight" in sd and "decoder.conv_norm_out.weight" in sd:
+            dec_last = int(sd["decoder.conv_in.weight"].shape[0])
+            dec_first = int(sd["decoder.conv_norm_out.weight"].shape[0])
+            decoder_block_out_channels = (dec_first, dec_first * 2, dec_last, dec_last)
+
+        with SilenceWarnings():
+            with accelerate.init_empty_weights():
+                model = AutoencoderKLFlux2(block_out_channels=encoder_block_out_channels)
+                if decoder_block_out_channels != encoder_block_out_channels:
+                    # Rebuild the decoder with the smaller channel widths.
+                    from diffusers.models.autoencoders.vae import Decoder
+
+                    cfg = model.config
+                    model.decoder = Decoder(
+                        in_channels=cfg.latent_channels,
+                        out_channels=cfg.out_channels,
+                        up_block_types=cfg.up_block_types,
+                        block_out_channels=decoder_block_out_channels,
+                        layers_per_block=cfg.layers_per_block,
+                        norm_num_groups=cfg.norm_num_groups,
+                        act_fn=cfg.act_fn,
+                        mid_block_add_attention=cfg.mid_block_add_attention,
+                    )
+
+        # Convert to bfloat16 and load
+        for k in sd.keys():
+            sd[k] = sd[k].to(torch.bfloat16)
+
+        load_state_dict_ignoring_extras(model, sd, source="FLUX.2 VAE checkpoint", assign=True)
+
+        model.to(self._torch_dtype_avoiding_float16())
+
+        model = self._apply_fp8_layerwise_casting(model, config, submodel_type)
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Any, type=ModelType.CLIPEmbed, format=ModelFormat.Diffusers)
+class CLIPDiffusersLoader(ModelLoader):
+    """Class to load main models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, CLIPEmbed_Diffusers_Config_Base):
+            raise ValueError("Only CLIPEmbedDiffusersConfig models are currently supported here.")
+
+        match submodel_type:
+            case SubModelType.Tokenizer:
+                return CLIPTokenizer.from_pretrained(Path(config.path) / "tokenizer", local_files_only=True)
+            case SubModelType.TextEncoder:
+                encoder_path = Path(config.path) / "text_encoder"
+                if config.variant is not ClipVariantType.G:
+                    return CLIPTextModel.from_pretrained(encoder_path, local_files_only=True)
+                # SD 3 conditions on CLIP-G's projected pooled output, so the projection is loaded too, and a folder
+                # without one is refused: transformers would initialize it at random and only warn.
+                model, loading_info = CLIPTextModelWithProjection.from_pretrained(
+                    encoder_path, local_files_only=True, output_loading_info=True
+                )
+                if "text_projection.weight" in loading_info["missing_keys"]:
+                    raise ValueError(
+                        f"The CLIP-G text encoder '{config.name}' has no text_projection, which SD 3 needs."
+                    )
+                return model
+
+        raise ValueError(
+            f"Only Tokenizer and TextEncoder submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Any, type=ModelType.CLIPEmbed, format=ModelFormat.Checkpoint)
+class CLIPSingleFileLoader(ModelLoader):
+    """Load a CLIP-L or CLIP-G text encoder from one safetensors file with transformers key names.
+
+    CLIP-L is built as a ``CLIPTextModel``, which FLUX.1 requires; SD 3 reads its unprojected pooled output, the same
+    value as SD 3's identity projection gives. CLIP-G is built with its projection, which SD 3 conditions on.
+    """
+
+    def get_size_fs(
+        self, config: AnyModelConfig, model_path: Path, submodel_type: Optional[SubModelType] = None
+    ) -> int:
+        # The tokenizer is bundled, not read from the file.
+        if submodel_type is SubModelType.Tokenizer:
+            return 0
+        return super().get_size_fs(config, model_path, submodel_type)
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, CLIPEmbed_Checkpoint_Config_Base):
+            raise ValueError("Only CLIPEmbed_Checkpoint configs are supported here.")
+
+        match submodel_type:
+            case SubModelType.Tokenizer:
+                return load_bundled_clip_tokenizer()
+            case SubModelType.TextEncoder:
+                return self._load_text_encoder(config)
+
+        raise ValueError(
+            f"Only Tokenizer and TextEncoder submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+    def _load_text_encoder(self, config: CLIPEmbed_Checkpoint_Config_Base) -> AnyModel:
+        sd = load_file(Path(config.path))
+        text_config = clip_text_config(config.variant)
+        model: CLIPTextModel | CLIPTextModelWithProjection
+        with accelerate.init_empty_weights():
+            if config.variant is ClipVariantType.G:
+                model = CLIPTextModelWithProjection(text_config)
+            else:
+                model = CLIPTextModel(text_config)
+                # transformers >=5.6 flattened CLIPTextModel, dropping the `text_model.` prefix the file carries.
+                sd = {key.removeprefix("text_model."): value for key, value in sd.items()}
+
+        reserve_for_load(
+            self._ram_cache.make_room,
+            sd,
+            self._torch_dtype,
+            keep_fp8=False,
+            model=model,
+            fp8_layers={},
+            nvfp4_payloads={},
+        )
+        cast_state_dict(sd, self._torch_dtype, keep_fp8=False)
+        # Ignored: `logit_scale` and a CLIP-L projection, which belong to the full CLIP model, and the persistent
+        # `position_ids` older exports carry.
+        load_state_dict_ignoring_extras(model, sd, source=f"single-file CLIP-{config.variant.name}", assign=True)
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Any, type=ModelType.T5Encoder, format=ModelFormat.BnbQuantizedLlmInt8b)
+class BnbQuantizedLlmInt8bCheckpointModel(ModelLoader):
+    """Class to load main models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, T5Encoder_BnBLLMint8_Config):
+            raise ValueError("Only T5EncoderBnbQuantizedLlmInt8bConfig models are currently supported here.")
+        if not bnb_available:
+            raise ImportError(
+                "The bnb modules are not available. Please install bitsandbytes if available on your platform."
+            )
+        match submodel_type:
+            case SubModelType.Tokenizer2 | SubModelType.Tokenizer3:
+                return T5Tokenizer.from_pretrained(
+                    Path(config.path) / "tokenizer_2", max_length=512, local_files_only=True
+                )
+            case SubModelType.TextEncoder2 | SubModelType.TextEncoder3:
+                te2_model_path = Path(config.path) / "text_encoder_2"
+                model_config = AutoConfig.from_pretrained(te2_model_path, local_files_only=True)
+                with accelerate.init_empty_weights():
+                    model = AutoModelForTextEncoding.from_config(model_config)
+                    model = quantize_model_llm_int8(model, modules_to_not_convert=set())
+
+                state_dict_path = te2_model_path / "bnb_llm_int8_model.safetensors"
+                state_dict = load_file(state_dict_path)
+                self._load_state_dict_into_t5(model, state_dict)
+
+                return model
+
+        raise ValueError(
+            f"Only Tokenizer and TextEncoder submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+    @classmethod
+    def _load_state_dict_into_t5(cls, model: T5EncoderModel, state_dict: dict[str, torch.Tensor]):
+        # There is a shared reference to a single weight tensor in the model.
+        # Both "encoder.embed_tokens.weight" and "shared.weight" refer to the same tensor, so only the latter should
+        # be present in the state_dict.
+        load_state_dict_ignoring_extras(
+            model,
+            state_dict,
+            source="FLUX bnb-int8 T5 encoder",
+            assign=True,
+            allowed_missing={"encoder.embed_tokens.weight"},
+        )
+        # Re-tie shared weights. In transformers 5.x, weight tying is implemented at the
+        # parameter level (via _tie_weights / tie_weights) rather than as a Python object
+        # alias.  load_state_dict(assign=True) replaces parameters in-place, which severs
+        # the parameter-level tie.  Calling tie_weights() re-establishes it.
+        model.tie_weights()
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Any, type=ModelType.T5Encoder, format=ModelFormat.T5Encoder)
+class T5EncoderCheckpointModel(ModelLoader):
+    """Class to load main models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, T5Encoder_T5Encoder_Config):
+            raise ValueError("Only T5EncoderConfig models are currently supported here.")
+
+        match submodel_type:
+            case SubModelType.Tokenizer2 | SubModelType.Tokenizer3:
+                return T5Tokenizer.from_pretrained(
+                    Path(config.path) / "tokenizer_2", max_length=512, local_files_only=True
+                )
+            case SubModelType.TextEncoder2 | SubModelType.TextEncoder3:
+                return T5EncoderModel.from_pretrained(
+                    Path(config.path) / "text_encoder_2",
+                    torch_dtype="auto",
+                    low_cpu_mem_usage=True,
+                    local_files_only=True,
+                )
+
+        raise ValueError(
+            f"Only Tokenizer and TextEncoder submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Any, type=ModelType.T5Encoder, format=ModelFormat.SDNQQuantized)
+class T5EncoderSDNQLoader(ModelLoader):
+    """Class to load SDNQ-quantized T5 Encoder models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, T5Encoder_SDNQ_Config):
+            raise ValueError("Only T5Encoder_SDNQ_Config models are supported here.")
+
+        match submodel_type:
+            case SubModelType.Tokenizer2 | SubModelType.Tokenizer3:
+                # tokenizer_2/ is a child of the pipeline root in the standalone layout but a sibling
+                # of the text_encoder_2 folder in the inline layout — resolve it the same way the
+                # encoder dir is resolved (identification already rejects installs where it's absent).
+                tokenizer_dir = T5Encoder_SDNQ_Config.resolve_tokenizer_dir(Path(config.path))
+                if tokenizer_dir is None:
+                    raise ValueError(f"No tokenizer_2 folder found for SDNQ T5 encoder at {config.path}")
+                return T5Tokenizer.from_pretrained(tokenizer_dir, max_length=512, local_files_only=True)
+            case SubModelType.TextEncoder2 | SubModelType.TextEncoder3:
+                return self._load_text_encoder(config)
+
+        raise ValueError(
+            f"Only Tokenizer and TextEncoder submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+    def _load_text_encoder(self, config: T5Encoder_SDNQ_Config) -> AnyModel:
+        # Two layouts: either config.path is the pipeline root (T5 lives under text_encoder_2/),
+        # or config.path is the text_encoder_2 folder itself (FluxPipeline submodel case).
+        te_dir = T5Encoder_SDNQ_Config.resolve_text_encoder_dir(Path(config.path))
+        if te_dir is None:
+            raise ValueError(f"No T5 encoder config.json found for SDNQ T5 encoder at {config.path}")
+
+        model_config = AutoConfig.from_pretrained(te_dir, local_files_only=True)
+        with accelerate.init_empty_weights():
+            model = AutoModelForTextEncoding.from_config(model_config)
+
+        sd = sdnq_sd_loader(te_dir, compute_dtype=torch.bfloat16)
+
+        # T5's embed_tokens and shared point to the same parameter; the SDNQ state dict only carries
+        # one of them, so encoder.embed_tokens.weight is expected to be missing (re-tied below). Use
+        # the explicit helper rather than assert, which `python -O` strips (silent partial loads).
+        missing_keys, unexpected_keys = model.load_state_dict(sd, strict=False, assign=True)
+        raise_on_incomplete_sdnq_load(
+            "SDNQ T5 encoder", missing_keys, unexpected_keys, allowed_missing={"encoder.embed_tokens.weight"}
+        )
+        if "encoder.embed_tokens.weight" in missing_keys:
+            model.encoder.embed_tokens.weight = model.shared.weight
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Any, type=ModelType.T5Encoder, format=ModelFormat.GGUFQuantized)
+class T5EncoderGGUFModel(ModelLoader):
+    """Class to load GGUF-quantized T5 text encoders (single .gguf file, llama.cpp naming).
+
+    The transformer weights are kept as GGMLTensors so the model cache's quantized-autocast layers can
+    dequantize them on-the-fly during inference. Embedding weights (token embeddings and the relative
+    attention bias) are dequantized eagerly since embedding lookups can't operate on quantized tensors.
+    """
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, T5Encoder_GGUF_Config):
+            raise ValueError("Only T5Encoder_GGUF_Config models are currently supported here.")
+
+        match submodel_type:
+            case SubModelType.Tokenizer2 | SubModelType.Tokenizer3:
+                return self._load_tokenizer()
+            case SubModelType.TextEncoder2 | SubModelType.TextEncoder3:
+                return self._load_from_gguf(config)
+
+        raise ValueError(
+            f"Only Tokenizer and TextEncoder submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+    def _load_tokenizer(self) -> AnyModel:
+        # GGUF T5 files don't bundle a tokenizer that transformers can read. Reuse the T5 v1.1 XXL
+        # tokenizer already vendored in the repo (Apache-2.0, same vocab), so no download is needed.
+        from invokeai.backend.t5.t5_tokenizer import load_bundled_t5_tokenizer
+
+        tokenizer = load_bundled_t5_tokenizer()
+        tokenizer.model_max_length = 512
+        return tokenizer
+
+    def _load_from_gguf(self, config: T5Encoder_GGUF_Config) -> AnyModel:
+        from invokeai.backend.quantization.gguf.ggml_tensor import GGMLTensor
+
+        model_path = Path(config.path)
+
+        # HACK(ryand): We shouldn't be hard-coding the compute_dtype here.
+        sd = gguf_sd_loader(model_path, compute_dtype=torch.bfloat16)
+
+        sd = self._convert_t5_gguf_to_transformers(sd)
+
+        t5_config = self._infer_t5_config_from_state_dict(sd)
+
+        with accelerate.init_empty_weights():
+            model = T5EncoderModel(t5_config)
+
+        # Leave transformer Linear weights as GGMLTensors; the autocast cache handles them.
+        load_state_dict_ignoring_extras(model, sd, source="FLUX GGUF T5 encoder", assign=True, allow_missing=True)
+
+        # Embedding lookups can't run on quantized GGMLTensors, so dequantize the token embeddings and
+        # re-tie the encoder's embed_tokens to the shared embedding.
+        shared_weight = model.shared.weight
+        if isinstance(shared_weight, GGMLTensor):
+            shared_weight = torch.nn.Parameter(shared_weight.get_dequantized_tensor(), requires_grad=False)
+            model.shared.weight = shared_weight
+        model.encoder.embed_tokens.weight = model.shared.weight
+
+        # The relative attention bias (only on the first block) is also an embedding lookup.
+        first_block_attn = model.encoder.block[0].layer[0].SelfAttention
+        rel_bias = first_block_attn.relative_attention_bias.weight
+        if isinstance(rel_bias, GGMLTensor):
+            first_block_attn.relative_attention_bias.weight = torch.nn.Parameter(
+                rel_bias.get_dequantized_tensor(), requires_grad=False
+            )
+
+        self._make_feed_forward_gguf_safe(model)
+
+        # Fail loudly if anything was left unloaded (meta tensors).
+        meta_params = [name for name, p in model.named_parameters() if p.is_meta]
+        if meta_params:
+            raise RuntimeError(
+                f"Failed to load all parameters from GGUF T5 encoder. Remaining meta tensors: {meta_params}. "
+                "This may indicate missing keys in the GGUF file or a key mapping issue."
+            )
+
+        return model
+
+    @staticmethod
+    def _make_feed_forward_gguf_safe(model: T5EncoderModel) -> None:
+        """Work around a transformers T5 quirk that breaks GGUF-quantized ``wo`` weights.
+
+        ``T5DenseGatedActDense.forward`` casts its activations to ``self.wo.weight.dtype`` unless that
+        dtype is ``torch.int8`` (a guard meant for bitsandbytes 8-bit quantization, see transformers
+        issue #20287). GGML stores quantized weights as ``torch.uint8``, which slips past the ``int8``
+        guard and causes the activations to be cast to an integer dtype, corrupting them. We rebind the
+        forward of each feed-forward module so the cast only happens for genuine floating-point weights;
+        the quantized ``wo`` is dequantized on-the-fly by the autocast Linear regardless.
+        """
+        import types
+
+        def gated_forward(self, hidden_states):  # mirrors T5DenseGatedActDense.forward
+            hidden_gelu = self.act(self.wi_0(hidden_states))
+            hidden_linear = self.wi_1(hidden_states)
+            hidden_states = hidden_gelu * hidden_linear
+            hidden_states = self.dropout(hidden_states)
+            if self.wo.weight.is_floating_point() and hidden_states.dtype != self.wo.weight.dtype:
+                hidden_states = hidden_states.to(self.wo.weight.dtype)
+            hidden_states = self.wo(hidden_states)
+            return hidden_states
+
+        def act_forward(self, hidden_states):  # mirrors T5DenseActDense.forward
+            hidden_states = self.wi(hidden_states)
+            hidden_states = self.act(hidden_states)
+            hidden_states = self.dropout(hidden_states)
+            if self.wo.weight.is_floating_point() and hidden_states.dtype != self.wo.weight.dtype:
+                hidden_states = hidden_states.to(self.wo.weight.dtype)
+            hidden_states = self.wo(hidden_states)
+            return hidden_states
+
+        patched = 0
+        for module in model.modules():
+            cls_name = module.__class__.__name__
+            if cls_name == "T5DenseGatedActDense":
+                module.forward = types.MethodType(gated_forward, module)
+                patched += 1
+            elif cls_name == "T5DenseActDense":
+                module.forward = types.MethodType(act_forward, module)
+                patched += 1
+
+        # Guard against a silent no-op: if transformers ever renames these feed-forward classes, the
+        # match above would patch nothing and the uint8-cast bug would silently corrupt encoder output.
+        # Fail loudly instead so the mismatch is caught at load time rather than in the generated images.
+        if patched == 0:
+            raise RuntimeError(
+                "Failed to patch any T5 feed-forward modules (expected T5DenseGatedActDense / T5DenseActDense). "
+                "The installed transformers version may have renamed these classes; the GGUF T5 encoder "
+                "cannot be loaded safely without the wo-dtype workaround."
+            )
+
+    def _infer_t5_config_from_state_dict(self, sd: dict[str, torch.Tensor]) -> "object":
+        """Reconstruct a ``T5Config`` from the (transformers-named) GGUF tensors.
+
+        This only supports the T5 v1.1 XXL encoder family (e.g. city96/t5-v1_1-xxl-encoder-gguf), which
+        is what the starter models and FLUX pipelines use. Dimensions that vary (vocab, d_model, layer
+        count, head/ff sizes) are read from tensor shapes; the fixed architectural constants below
+        (``relative_attention_max_distance``, ``layer_norm_epsilon``, gated-gelu activation) are the T5
+        v1.1 defaults and would need revisiting for other T5 variants.
+
+        Note: ``.shape`` on a ``GGMLTensor`` already returns the dequantized (logical) shape, so quantized
+        and unquantized tensors can be read the same way here.
+        """
+        from transformers import T5Config
+
+        # Number of encoder blocks.
+        num_layers = 0
+        for key in sd.keys():
+            if isinstance(key, str) and key.startswith("encoder.block."):
+                try:
+                    num_layers = max(num_layers, int(key.split(".")[2]) + 1)
+                except (IndexError, ValueError):
+                    pass
+
+        shared = sd.get("shared.weight")
+        if shared is None:
+            raise ValueError("Could not find shared.weight (token embeddings) in T5 GGUF state dict")
+        vocab_size, d_model = (int(x) for x in shared.shape)
+
+        # Inner attention dim from q projection: nn.Linear(d_model, inner_dim) -> weight (inner_dim, d_model).
+        q_weight = sd.get("encoder.block.0.layer.0.SelfAttention.q.weight")
+        if q_weight is None:
+            raise ValueError("Could not find SelfAttention.q.weight in T5 GGUF state dict")
+        inner_dim = int(q_weight.shape[0])
+
+        # Number of heads and buckets from the relative attention bias: nn.Embedding(num_buckets, num_heads).
+        rel_bias = sd.get("encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight")
+        if rel_bias is None:
+            raise ValueError("Could not find relative_attention_bias.weight in T5 GGUF state dict")
+        num_buckets = int(rel_bias.shape[0])
+        num_heads = int(rel_bias.shape[1])
+        d_kv = inner_dim // num_heads
+
+        # Feed-forward dim from the gated FFN: nn.Linear(d_model, d_ff) -> weight (d_ff, d_model).
+        wi_0 = sd.get("encoder.block.0.layer.1.DenseReluDense.wi_0.weight")
+        if wi_0 is None:
+            raise ValueError("Could not find DenseReluDense.wi_0.weight in T5 GGUF state dict")
+        d_ff = int(wi_0.shape[0])
+
+        return T5Config(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            d_kv=d_kv,
+            d_ff=d_ff,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            relative_attention_num_buckets=num_buckets,
+            relative_attention_max_distance=128,  # T5 v1.1 default
+            layer_norm_epsilon=1e-6,  # T5 v1.1 default
+            feed_forward_proj="gated-gelu",
+            is_gated_act=True,
+            dense_act_fn="gelu_new",
+            tie_word_embeddings=False,
+            use_cache=False,
+        )
+
+    def _convert_t5_gguf_to_transformers(self, sd: dict[str, Any]) -> dict[str, Any]:
+        """Convert llama.cpp T5 encoder GGUF keys to HuggingFace transformers T5 naming.
+
+        llama.cpp T5 encoder format:
+        - token_embd.weight                  -> shared.weight
+        - enc.output_norm.weight             -> encoder.final_layer_norm.weight
+        - enc.blk.N.attn_q/k/v/o.weight      -> encoder.block.N.layer.0.SelfAttention.q/k/v/o.weight
+        - enc.blk.0.attn_rel_b.weight        -> encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight
+        - enc.blk.N.attn_norm.weight         -> encoder.block.N.layer.0.layer_norm.weight
+        - enc.blk.N.ffn_gate.weight          -> encoder.block.N.layer.1.DenseReluDense.wi_0.weight (gated/activated)
+        - enc.blk.N.ffn_up.weight            -> encoder.block.N.layer.1.DenseReluDense.wi_1.weight (linear)
+        - enc.blk.N.ffn_down.weight          -> encoder.block.N.layer.1.DenseReluDense.wo.weight
+        - enc.blk.N.ffn_norm.weight          -> encoder.block.N.layer.1.layer_norm.weight
+        """
+        import re
+
+        attn_map = {
+            "attn_q": "SelfAttention.q",
+            "attn_k": "SelfAttention.k",
+            "attn_v": "SelfAttention.v",
+            "attn_o": "SelfAttention.o",
+            "attn_rel_b": "SelfAttention.relative_attention_bias",
+            "attn_norm": "layer_norm",
+        }
+        ffn_map = {
+            "ffn_gate": "DenseReluDense.wi_0",
+            "ffn_up": "DenseReluDense.wi_1",
+            "ffn_down": "DenseReluDense.wo",
+            "ffn_norm": "layer_norm",
+        }
+
+        new_sd: dict[str, Any] = {}
+        blk_pattern = re.compile(r"^enc\.blk\.(\d+)\.(.+)$")
+
+        for key, value in sd.items():
+            if not isinstance(key, str):
+                new_sd[key] = value
+                continue
+
+            if key == "token_embd.weight":
+                new_sd["shared.weight"] = value
+                continue
+            if key == "enc.output_norm.weight":
+                new_sd["encoder.final_layer_norm.weight"] = value
+                continue
+
+            match = blk_pattern.match(key)
+            if match:
+                layer_idx = match.group(1)
+                rest = match.group(2)
+                component = rest.split(".", 1)[0]
+
+                if component in attn_map:
+                    new_sd[f"encoder.block.{layer_idx}.layer.0.{attn_map[component]}.weight"] = value
+                elif component in ffn_map:
+                    new_sd[f"encoder.block.{layer_idx}.layer.1.{ffn_map[component]}.weight"] = value
+                else:
+                    # Unknown component - keep as-is so the meta-tensor check surfaces it.
+                    new_sd[key] = value
+                continue
+
+            new_sd[key] = value
+
+        return new_sd
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux, type=ModelType.Main, format=ModelFormat.Checkpoint)
+class FluxCheckpointModel(ModelLoader):
+    """Class to load main models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, Checkpoint_Config_Base):
+            raise ValueError("Only CheckpointConfigBase models are currently supported here.")
+
+        match submodel_type:
+            case SubModelType.Transformer:
+                model = self._load_from_singlefile(config)
+                if isinstance(model, torch.nn.Module) and any(
+                    isinstance(module, Int8ConvrotLinear) for module in model.modules()
+                ):
+                    # The storage pass cannot reach an int8 weight -- `Int8ConvrotLinear` is neither
+                    # one of `_FP8_SUPPORTED_PYTORCH_LAYERS` nor an owner of parameters. What it
+                    # would still cast is the dense remainder: the embedders, the timestep, vector
+                    # and guidance MLPs and the final layer, 423 MB of an 11.5 GiB model. Those are
+                    # exactly the layers the repack chose to leave bf16, and `Flux` declares no skip
+                    # patterns to protect them, so 3.6% is not worth e4m3 on the model's entry and
+                    # exit. Same decision as the FLUX.2 arm below.
+                    if getattr(getattr(config, "default_settings", None), "fp8_storage", None):
+                        self._logger.info(
+                            "FLUX: the model's fp8_storage setting was skipped - this is an "
+                            "int8_tensorwise checkpoint, already one byte per quantized weight."
+                        )
+                    return model
+                model = self._apply_fp8_layerwise_casting(model, config, submodel_type)
+                return model
+
+        raise ValueError(
+            f"Only Transformer submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+    def _load_from_singlefile(
+        self,
+        config: AnyModelConfig,
+    ) -> AnyModel:
+        assert isinstance(config, Main_Checkpoint_FLUX_Config)
+        model_path = Path(config.path)
+
+        with accelerate.init_empty_weights():
+            model = Flux(get_flux_transformers_params(config.variant))
+
+        sd = load_file(model_path)
+        if "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.scale" in sd:
+            sd = convert_bundle_to_flux_transformer_checkpoint(sd)
+
+        # ComfyUI 'scaled fp8' (fp8 weight + .weight_scale/.scale_weight, optionally an input
+        # scale). Read *after* the bundle conversion: the scale keys carry the same
+        # `model.diffusion_model.` prefix as the weights and only line up with the module tree once
+        # it has been stripped. Until now the loader had no idea these keys existed and
+        # `load_state_dict` rejected the checkpoint outright as unexpected keys.
+        #
+        # Unlike FLUX.2 there is no key conversion here: the checkpoint is already in the BFL
+        # layout this model implements, and `qkv` stays one fused Linear, so a per-tensor scale
+        # attaches to exactly the module it was computed for.
+        #
+        # Hints ship either in the safetensors header or as per-layer `.comfy_quant` markers. For
+        # the fp8 merge below the header wins on the rare checkpoint carrying both; for the int8
+        # merge the per-layer marker does, because only it can carry `convrot` and the group size.
+        metadata = read_safetensors_metadata(model_path, self._logger)
+        # Header names still carry the checkpoint prefix that was stripped off `sd`; strip it from
+        # them too, or every per-layer flag matches nothing.
+        header_hints = strip_layer_path_prefix(parse_quantization_metadata(metadata))
+
+        # Which of the two ComfyUI side channels this file carries is decided once, and int8 first:
+        # an int8 layer ships a `.weight_scale` too, so probing for scales without ruling int8 out
+        # would take the whole checkpoint down the fp8 path -- scaled, but never un-rotated, which
+        # loads cleanly and generates noise.
+        #
+        # No rename stands between the markers and the module tree here: unlike FLUX.2 the
+        # checkpoint is already in this model's BFL layout and `qkv` stays one fused Linear, so a
+        # marker names exactly the module it was written for.
+        # The header entries are filtered against `sd`, which the per-layer markers are by
+        # construction. Two things can otherwise put a name there that this load has no weight for:
+        # stale metadata from a repack tool, which would route a plain bf16 checkpoint into the int8
+        # branch and kill it at the swap; and a merged export, whose header still describes the
+        # bundled encoder after `convert_bundle_to_flux_transformer_checkpoint` has deleted it. The
+        # dtype test is what separates a real int8 layer from both.
+        int8_markers = {
+            **{
+                name: marker
+                for name, marker in header_hints.items()
+                if marker.get("format") == INT8_TENSORWISE_FORMAT
+                and getattr(sd.get(f"{name}.weight"), "dtype", None) is torch.int8
+            },
+            **extract_int8_convrot_markers(sd),
+        }
+        # Outside the branch below on purpose (see the helper): an int8 weight that neither a marker
+        # nor the header claims would otherwise reach `load_state_dict` as raw codes. On this
+        # architecture that raises rather than loading quietly -- int8 is not a float dtype, so the
+        # cast skips it and assigning it to a float Parameter fails -- but the message names a
+        # gradient error rather than the checkpoint, which is the whole reason to check here.
+        # `model` narrows this to weights the transformer consumes, so a merged file's bundled
+        # encoder is left to the non-strict load that discards it.
+        reject_unmarked_int8_weights(sd, int8_markers, "FLUX", model)
+
+        fp8_layers: dict[str, Fp8ScaledLayer] = {}
+        if not int8_markers:
+            layer_hints = {**extract_comfy_quant_hints(sd), **header_hints}
+            fp8_layers = extract_fp8_scaled_layers(sd, layer_hints=layer_hints)
+
+        # The `match` above admits only the transformer, so that is the submodel the cast will be
+        # asked about too -- keep and cast therefore decide on the same input.
+        keep_fp8 = self._keep_fp8_weights(config, SubModelType.Transformer)
+        skip_patterns = _model_declared_skip_patterns(model)
+
+        if int8_markers:
+            # W8A8 activation scales and any marker of another format: meaningless on this path,
+            # which dequantizes the weight and computes in bf16.
+            sd = drop_unconsumed_quantization_sidecars(sd)
+
+            quantized = install_int8_convrot_layers(
+                model,
+                sd,
+                int8_markers,
+                torch.bfloat16,
+                architecture="FLUX",
+                reserve=self._ram_cache.make_room,
+                skip_patterns=skip_patterns,
+            )
+            load_state_dict_ignoring_extras(model, sd, source="FLUX transformer checkpoint", assign=True)
+
+            # No setting behind this one and nothing to fall back to: `Int8ConvrotLinear` holds the
+            # stored codes and dequantizes per forward, so an 11.5 GiB file stays 11.5 GiB resident
+            # on every device. What it does not get is int8 *compute*.
+            self._logger.info(
+                f"FLUX: kept {len(quantized)} layer(s) in int8 (int8_tensorwise checkpoint, dequantized per forward)"
+            )
+            return model
+        # Reserve before anything below widens a weight -- the fold and the split both do, and
+        # reserving afterwards lets either peak land on a cache that was only ever sized for the
+        # file. `scaled_layers` is what keeps the prediction honest where the weights are kept: the
+        # split also widens layers whose scale layout `scaled_mm` cannot apply, and without the
+        # mapping the prediction would charge those 1 byte/element and arrive at 2. Where they are
+        # not kept the prediction charges every float at the compute dtype, folded yet or not, so
+        # the number is the same on either side of the fold -- what changes is when the room exists.
+        reserve_for_load(
+            self._ram_cache.make_room,
+            sd,
+            torch.bfloat16,
+            keep_fp8=keep_fp8,
+            model=model,
+            skip_patterns=skip_patterns,
+            fp8_layers=fp8_layers,
+            nvfp4_payloads={},
+        )
+
+        if fp8_layers and not keep_fp8:
+            # Neither consumer asked for them, and dequantizing per forward would cost speed for
+            # memory nobody wanted saved. Fold the scale into the weight instead — the legacy
+            # result, except the scale is now actually applied rather than dropped.
+            dequantize_fp8_scaled(sd, fp8_layers, torch.bfloat16)
+            fp8_layers = {}
+
+        # Scaled layers that the cast would dequantize anyway are folded here too, scale applied, so
+        # `cast_state_dict` never strips a scale that can no longer be put back.
+        fp8_layers = split_fp8_scaled_layers(sd, fp8_layers, torch.bfloat16, model=model, skip_patterns=skip_patterns)
+        # Everything else is cast to bfloat16, the only dtype currently supported for inference.
+        kept = cast_state_dict(sd, torch.bfloat16, keep_fp8=keep_fp8, model=model, skip_patterns=skip_patterns)
+        load_state_dict_ignoring_extras(model, sd, source="FLUX transformer checkpoint", assign=True)
+
+        if fp8_layers:
+            attached = attach_fp8_scales(model, fp8_layers)
+            self._logger.info(
+                f"FLUX: kept {attached} layer(s) in fp8 (scaled fp8 checkpoint, kept for {self._fp8_kept_reason()})"
+            )
+            warn_on_unattached_scales(self._logger, "FLUX", attached, fp8_layers)
+            marked = sum(1 for layer in fp8_layers.values() if layer.full_precision_matmul)
+            if marked and full_precision_hints_respected():
+                self._logger.info(
+                    f"FLUX: {marked} of {len(fp8_layers)} layer(s) are marked full_precision_matrix_mult "
+                    "and will dequantize per forward. Set fp8_compute_full_precision_hints=false to run "
+                    "them on the fp8 tensor cores instead."
+                )
+        elif kept:
+            self._logger.info(f"FLUX: kept {kept} raw fp8 weight(s) quantized ({self._fp8_kept_reason()}).")
+
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux, type=ModelType.Main, format=ModelFormat.GGUFQuantized)
+class FluxGGUFCheckpointModel(ModelLoader):
+    """Class to load GGUF main models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, Checkpoint_Config_Base):
+            raise ValueError("Only CheckpointConfigBase models are currently supported here.")
+
+        match submodel_type:
+            case SubModelType.Transformer:
+                return self._load_from_singlefile(config)
+
+        raise ValueError(
+            f"Only Transformer submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+    def _load_from_singlefile(
+        self,
+        config: AnyModelConfig,
+    ) -> AnyModel:
+        assert isinstance(config, Main_GGUF_FLUX_Config)
+        model_path = Path(config.path)
+
+        with accelerate.init_empty_weights():
+            model = Flux(get_flux_transformers_params(config.variant))
+
+        # HACK(ryand): We shouldn't be hard-coding the compute_dtype here.
+        sd = gguf_sd_loader(model_path, compute_dtype=torch.bfloat16)
+
+        # HACK(ryand): There are some broken GGUF models in circulation that have the wrong shape for img_in.weight.
+        # We override the shape here to fix the issue.
+        # Example model with this issue (Q4_K_M): https://civitai.com/models/705823/ggufk-flux-unchained-km-quants
+        img_in_weight = sd.get("img_in.weight", None)
+        if img_in_weight is not None and img_in_weight._ggml_quantization_type in TORCH_COMPATIBLE_QTYPES:
+            expected_img_in_weight_shape = model.img_in.weight.shape
+            img_in_weight.quantized_data = img_in_weight.quantized_data.view(expected_img_in_weight_shape)
+            img_in_weight.tensor_shape = expected_img_in_weight_shape
+
+        load_state_dict_ignoring_extras(model, sd, source="FLUX GGUF transformer checkpoint", assign=True)
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux, type=ModelType.Main, format=ModelFormat.BnbQuantizednf4b)
+class FluxBnbQuantizednf4bCheckpointModel(ModelLoader):
+    """Class to load main models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, Checkpoint_Config_Base):
+            raise ValueError("Only CheckpointConfigBase models are currently supported here.")
+
+        match submodel_type:
+            case SubModelType.Transformer:
+                return self._load_from_singlefile(config)
+
+        raise ValueError(
+            f"Only Transformer submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+    def _load_from_singlefile(
+        self,
+        config: AnyModelConfig,
+    ) -> AnyModel:
+        assert isinstance(config, Main_BnBNF4_FLUX_Config)
+        if not bnb_available:
+            raise ImportError(
+                "The bnb modules are not available. Please install bitsandbytes if available on your platform."
+            )
+        model_path = Path(config.path)
+
+        with SilenceWarnings():
+            with accelerate.init_empty_weights():
+                model = Flux(get_flux_transformers_params(config.variant))
+                model = quantize_model_nf4(model, modules_to_not_convert=set(), compute_dtype=torch.bfloat16)
+            sd = load_file(model_path)
+            if "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.scale" in sd:
+                sd = convert_bundle_to_flux_transformer_checkpoint(sd)
+            load_state_dict_ignoring_extras(model, sd, source="FLUX nf4 transformer checkpoint", assign=True)
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux, type=ModelType.Main, format=ModelFormat.Diffusers)
+class FluxDiffusersModel(GenericDiffusersLoader):
+    """Class to load FLUX.1 main models in diffusers format."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if isinstance(config, Checkpoint_Config_Base):
+            raise NotImplementedError("CheckpointConfigBase is not implemented for FLUX diffusers models.")
+
+        if submodel_type is None:
+            raise Exception("A submodel type must be provided when loading main pipelines.")
+
+        model_path = Path(config.path)
+        load_class = self.get_hf_load_class(model_path, submodel_type)
+        repo_variant = config.repo_variant if isinstance(config, Diffusers_Config_Base) else None
+        variant = repo_variant.value if repo_variant else None
+        model_path = model_path / submodel_type.value
+
+        # We force bfloat16 for FLUX models. This is required for correct inference.
+        dtype = torch.bfloat16
+        try:
+            result: AnyModel = load_class.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                variant=variant,
+                local_files_only=True,
+            )
+        except OSError as e:
+            if variant and "no file named" in str(
+                e
+            ):  # try without the variant, just in case user's preferences changed
+                result = load_class.from_pretrained(model_path, torch_dtype=dtype, local_files_only=True)
+            else:
+                raise e
+
+        result = self._apply_fp8_layerwise_casting(result, config, submodel_type)
+        return result
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux2, type=ModelType.Main, format=ModelFormat.Diffusers)
+class Flux2DiffusersModel(GenericDiffusersLoader):
+    """Class to load FLUX.2 main models in diffusers format (e.g. FLUX.2 Klein)."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if isinstance(config, Checkpoint_Config_Base):
+            raise NotImplementedError("CheckpointConfigBase is not implemented for FLUX.2 diffusers models.")
+
+        if submodel_type is None:
+            raise Exception("A submodel type must be provided when loading main pipelines.")
+
+        model_path = Path(config.path)
+        load_class = self.get_hf_load_class(model_path, submodel_type)
+        repo_variant = config.repo_variant if isinstance(config, Diffusers_Config_Base) else None
+        variant = repo_variant.value if repo_variant else None
+        model_path = model_path / submodel_type.value
+
+        # We force bfloat16 for FLUX.2 models. This is required for correct inference.
+        # We use low_cpu_mem_usage=False to avoid meta tensors for weights not in checkpoint.
+        # FLUX.2 Klein models may have guidance_embeds=False, so the guidance_embed layers
+        # won't be in the checkpoint but the model class still creates them.
+        # We use SilenceWarnings to suppress the "guidance_embeds is not expected" warning
+        # from diffusers Flux2Transformer2DModel.
+        dtype = torch.bfloat16
+        with SilenceWarnings():
+            try:
+                result: AnyModel = load_class.from_pretrained(
+                    model_path,
+                    torch_dtype=dtype,
+                    variant=variant,
+                    local_files_only=True,
+                    low_cpu_mem_usage=False,
+                )
+            except OSError as e:
+                if variant and "no file named" in str(
+                    e
+                ):  # try without the variant, just in case user's preferences changed
+                    result = load_class.from_pretrained(
+                        model_path,
+                        torch_dtype=dtype,
+                        local_files_only=True,
+                        low_cpu_mem_usage=False,
+                    )
+                else:
+                    raise e
+
+        # For Klein models without guidance_embeds, zero out the guidance_embedder weights
+        # that were randomly initialized by diffusers. This prevents noise from affecting
+        # the time embeddings.
+        if submodel_type == SubModelType.Transformer and hasattr(result, "time_guidance_embed"):
+            # Check if this is a Klein model without guidance (guidance_embeds=False in config)
+            transformer_config_path = model_path / "config.json"
+            if transformer_config_path.exists():
+                import json
+
+                with open(transformer_config_path, "r") as f:
+                    transformer_config = json.load(f)
+                if not transformer_config.get("guidance_embeds", True):
+                    # Zero out the guidance embedder weights
+                    guidance_emb = result.time_guidance_embed.guidance_embedder
+                    if hasattr(guidance_emb, "linear_1"):
+                        guidance_emb.linear_1.weight.data.zero_()
+                        if guidance_emb.linear_1.bias is not None:
+                            guidance_emb.linear_1.bias.data.zero_()
+                    if hasattr(guidance_emb, "linear_2"):
+                        guidance_emb.linear_2.weight.data.zero_()
+                        if guidance_emb.linear_2.bias is not None:
+                            guidance_emb.linear_2.bias.data.zero_()
+
+        result = self._apply_fp8_layerwise_casting(result, config, submodel_type)
+        return result
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux2, type=ModelType.Main, format=ModelFormat.Checkpoint)
+class Flux2CheckpointModel(ModelLoader):
+    """Class to load FLUX.2 transformer models from single-file checkpoints (safetensors)."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, Checkpoint_Config_Base):
+            raise ValueError("Only CheckpointConfigBase models are currently supported here.")
+
+        match submodel_type:
+            case SubModelType.Transformer:
+                model = self._load_from_singlefile(config)
+                if isinstance(model, torch.nn.Module) and any(
+                    isinstance(module, Int8ConvrotLinear) for module in model.modules()
+                ):
+                    # The storage pass cannot reach an int8 weight: it casts only
+                    # `_FP8_SUPPORTED_PYTORCH_LAYERS`, and `Int8ConvrotLinear` is neither one of
+                    # them nor an owner of parameters. What it *could* still cast is the dense
+                    # remainder -- the modulation projections feeding AdaLN shift/scale/gate, the
+                    # embedders and the final layer, ~285M parameters. Those are precisely what the
+                    # repack chose to leave bf16, and the model's own skip patterns
+                    # (`pos_embed`, `norm`) do not protect them, so the pass is skipped rather than
+                    # allowed to undo that choice for ~140 MB. Krea-2's Qwen3-VL encoder loader
+                    # makes the same call for the same reason.
+                    if getattr(getattr(config, "default_settings", None), "fp8_storage", None):
+                        self._logger.info(
+                            "FLUX.2: the model's fp8_storage setting was skipped - this is an "
+                            "int8_tensorwise checkpoint, already one byte per quantized weight."
+                        )
+                    return model
+                model = self._apply_fp8_layerwise_casting(model, config, submodel_type)
+                return model
+
+        raise ValueError(
+            f"Only Transformer submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+    def _load_from_singlefile(
+        self,
+        config: AnyModelConfig,
+    ) -> AnyModel:
+        from diffusers import Flux2Transformer2DModel
+
+        if not isinstance(config, Main_Checkpoint_Flux2_Config):
+            raise TypeError(
+                f"Expected Main_Checkpoint_Flux2_Config, got {type(config).__name__}. "
+                "Model configuration type mismatch."
+            )
+        model_path = Path(config.path)
+
+        # Load state dict
+        sd = load_file(model_path)
+
+        # The `match` above admits only the transformer, so that is the submodel the cast will be
+        # asked about too -- keep and cast therefore decide on the same input.
+        keep_fp8 = self._keep_fp8_weights(config, SubModelType.Transformer)
+
+        # Check if keys have ComfyUI-style prefix and strip if needed. This runs before anything
+        # reads the quantization side-channel: the scales carry the same prefix as their weights.
+        sd = CheckpointPrefix.detect(sd).strip(sd)
+
+        # Which of the two ComfyUI side channels this file carries is decided once, and int8 first:
+        # an int8 layer ships a `.weight_scale` too, so probing for scales without ruling int8 out
+        # would take the whole checkpoint down the fp8 path -- scaled, never dequantized to a dtype
+        # torch computes in, and for a `convrot` repack never un-rotated either.
+        has_int8_weights = any(
+            isinstance(key, str) and key.endswith(".weight") and getattr(value, "dtype", None) is torch.int8
+            for key, value in sd.items()
+        )
+
+        int8_markers: dict[str, dict[str, Any]] = {}
+        fp8_layers: dict[str, Fp8ScaledLayer] = {}
+        # Where each BFL module's weight lands, recorded by the conversion itself. Both branches
+        # re-key the header's per-layer entries with it; they differ only in when they convert.
+        flux2_modules: dict[str, list[str]] = {}
+
+        if has_int8_weights:
+            # The converter carries `.comfy_quant` and `.weight_scale` to wherever their weight
+            # landed, so the markers are read *after* the rename and already name diffusers modules
+            # -- including the three a fused `qkv` becomes, which each inherit the fused layer's
+            # per-tensor scale and marker.
+            converted_sd = convert_flux2_bfl_to_diffusers(sd, module_map=flux2_modules)
+            int8_markers = extract_int8_convrot_markers(converted_sd)
+            # The header is the other place a repack declares its scheme, and for FLUX.2 that is
+            # not hypothetical: Comfy-Org's own fp8 build of this model carries *no* per-layer
+            # markers and names every layer in `_quantization_metadata`. A build from that tooling
+            # would otherwise be refused for a marker it never had to write. Header entries name
+            # layers in the BFL scheme, so they need the same one-to-many rename the fp8 branch
+            # applies, and a per-layer marker wins where both are present -- only that one can
+            # carry `convrot` and the group size.
+            header_markers = {
+                renamed: marker
+                for name, marker in strip_layer_path_prefix(
+                    parse_quantization_metadata(read_safetensors_metadata(model_path, self._logger))
+                ).items()
+                if marker.get("format") == INT8_TENSORWISE_FORMAT
+                for renamed in (flux2_modules.get(name) or [name])
+            }
+            int8_markers = {**header_markers, **int8_markers}
+        else:
+            # ComfyUI 'scaled fp8' (fp8 weight + .weight_scale, optionally an input scale). Until
+            # now these were folded into bf16 at load, so a FLUX.2 checkpoint that ships them ran as
+            # fp8 *storage* at best and never reached the tensor cores.
+            #
+            # Hints ship in the safetensors header or as per-layer `.comfy_quant` markers, and both
+            # name layers in the checkpoint's BFL scheme. The scales are read after the rename, so
+            # the hints have to be renamed too -- a fused `qkv` becomes three diffusers layers.
+            header_hints = strip_layer_path_prefix(
+                parse_quantization_metadata(read_safetensors_metadata(model_path, self._logger))
+            )
+            layer_hints = {**extract_comfy_quant_hints(sd), **header_hints}
+
+            # Convert BFL format state dict to diffusers format. Scales and markers are carried to
+            # wherever their weight landed, including across the fused-qkv split. The conversion
+            # runs before the hints are re-keyed because it is what *knows* the mapping: a probe
+            # asked by name cannot see that a fused qkv whose rows are not divisible by three is
+            # left unsplit, and would fan a hint onto three modules that do not exist.
+            converted_sd = convert_flux2_bfl_to_diffusers(sd, module_map=flux2_modules)
+
+            layer_hints = {
+                renamed: hints for name, hints in layer_hints.items() for renamed in (flux2_modules.get(name) or [name])
+            }
+
+            fp8_layers = extract_fp8_scaled_layers(converted_sd, layer_hints=layer_hints)
+
+            if not keep_fp8:
+                # Reserve before the two steps below widen weights: the scale fold, and
+                # `_dequantize_fp8_weights`'s raw-fp8 conversion. Unlike its peers this loader cannot
+                # leave that to the one reservation further down -- the architecture is read off these
+                # very keys, so no model exists yet to size a prediction against. It does not need one
+                # here: `predict_cast_state_dict_size` consults the model only to decide what *stays*
+                # quantized, and with `keep_fp8` false nothing does, so the model-less number is the
+                # same one. With `keep_fp8` true neither step widens anything, and the reservation
+                # below covers the split on its own.
+                # Through the shared reservation, for the scales `extract_fp8_scaled_layers` has just
+                # recovered: they are resident across this `make_room` and are consumed by the fold
+                # immediately below, and `predict_cast_state_dict_size` cannot see them because they
+                # are no longer in the dict. On an MXFP8 build that is ~0.125 B per weight element of
+                # decoded exponent grid. No model here, which is fine -- `keep_fp8` is false, so the
+                # prediction does not consult one, and no nvfp4 payload exists on this path.
+                reserve_for_load(
+                    self._ram_cache.make_room,
+                    converted_sd,
+                    torch.bfloat16,
+                    keep_fp8=False,
+                    model=None,
+                    fp8_layers=fp8_layers,
+                    nvfp4_payloads={},
+                )
+
+            if fp8_layers and not keep_fp8:
+                # Neither the matmul nor FP8 Storage asked for them, so keeping them quantized would
+                # dequantize on every forward to save memory nobody wanted saved. Fold the scale in
+                # -- the legacy result, except reached through the shared helper.
+                dequantize_fp8_scaled(converted_sd, fp8_layers, torch.bfloat16)
+                fp8_layers = {}
+
+            # Reached only for the raw-fp8 conversion and the metadata strip. Its scale fold cannot
+            # fire here: `extract_fp8_scaled_layers` above takes every scale key it is shown, by
+            # suffix, whatever the layout — so no weight/scale pair survives this far. Moving this
+            # call above that one would make the fold live again, which is what
+            # `test_flux2_int8_convrot_loader.py::test_the_extraction_runs_before_the_fold_safety_net`
+            # is there to catch.
+            converted_sd = self._dequantize_fp8_weights(converted_sd, keep_fp8=keep_fp8)
+
+        # Detect architecture from checkpoint keys
+        double_block_indices = [
+            int(k.split(".")[1])
+            for k in converted_sd.keys()
+            if isinstance(k, str) and k.startswith("transformer_blocks.")
+        ]
+        single_block_indices = [
+            int(k.split(".")[1])
+            for k in converted_sd.keys()
+            if isinstance(k, str) and k.startswith("single_transformer_blocks.")
+        ]
+
+        num_layers = max(double_block_indices) + 1 if double_block_indices else 5
+        num_single_layers = max(single_block_indices) + 1 if single_block_indices else 20
+
+        # Get dimensions from weights
+        # context_embedder.weight shape: [hidden_size, joint_attention_dim]
+        context_embedder_weight = converted_sd.get("context_embedder.weight")
+        if context_embedder_weight is not None:
+            hidden_size = context_embedder_weight.shape[0]
+            joint_attention_dim = context_embedder_weight.shape[1]
+        else:
+            # Default to Klein 4B dimensions
+            hidden_size = 3072
+            joint_attention_dim = 7680
+
+        x_embedder_weight = converted_sd.get("x_embedder.weight")
+        if x_embedder_weight is not None:
+            in_channels = x_embedder_weight.shape[1]
+        else:
+            in_channels = 128
+
+        # Calculate num_attention_heads from hidden_size
+        # Klein 4B: hidden_size=3072, num_attention_heads=24 (3072/128=24)
+        # Klein 9B: hidden_size=4096, num_attention_heads=32 (4096/128=32)
+        attention_head_dim = 128
+        num_attention_heads = hidden_size // attention_head_dim
+
+        # Klein models don't have guidance embeddings - check if they're in the checkpoint
+        has_guidance = "time_guidance_embed.guidance_embedder.linear_1.weight" in converted_sd
+
+        # Outside the branch on purpose (see the helper): an int8 weight that neither a marker nor
+        # the header claims would otherwise be cast to bf16 as raw codes and load silently. In the
+        # fp8 branch `int8_markers` is empty, so this also catches an int8 payload that arrived
+        # down that path.
+        reject_unmarked_int8_weights(converted_sd, int8_markers, "FLUX.2")
+
+        # Create model with detected configuration
+        with SilenceWarnings():
+            with accelerate.init_empty_weights():
+                model = Flux2Transformer2DModel(
+                    in_channels=in_channels,
+                    out_channels=in_channels,
+                    num_layers=num_layers,
+                    num_single_layers=num_single_layers,
+                    attention_head_dim=attention_head_dim,
+                    num_attention_heads=num_attention_heads,
+                    joint_attention_dim=joint_attention_dim,
+                    patch_size=1,
+                )
+
+        # If Klein model without guidance, initialize guidance embedder with zeros
+        if not has_guidance:
+            # Get the expected dimensions from timestep embedder (they should match)
+            timestep_linear1 = converted_sd.get("time_guidance_embed.timestep_embedder.linear_1.weight")
+            if timestep_linear1 is not None:
+                in_features = timestep_linear1.shape[1]
+                out_features = timestep_linear1.shape[0]
+                # Initialize guidance embedder with same shape as timestep embedder
+                converted_sd["time_guidance_embed.guidance_embedder.linear_1.weight"] = torch.zeros(
+                    out_features, in_features, dtype=torch.bfloat16
+                )
+                timestep_linear2 = converted_sd.get("time_guidance_embed.timestep_embedder.linear_2.weight")
+                if timestep_linear2 is not None:
+                    in_features2 = timestep_linear2.shape[1]
+                    out_features2 = timestep_linear2.shape[0]
+                    converted_sd["time_guidance_embed.guidance_embedder.linear_2.weight"] = torch.zeros(
+                        out_features2, in_features2, dtype=torch.bfloat16
+                    )
+
+        # Convert to bfloat16 and load, leaving raw fp8 weights quantized when the tensor cores can
+        # take them (the scaled-fp8 path above has already folded any weight_scale it found). The
+        # model's own precision-sensitive list is honored — see the Z-Image loader for why that is
+        # a correctness requirement and not just a quality nicety.
+        skip_patterns = _model_declared_skip_patterns(model)
+
+        if int8_markers:
+            # W8A8 activation scales and any marker of another format: meaningless on this path,
+            # which dequantizes the weight and computes in bf16. Dropped rather than tolerated
+            # because they would otherwise be cast and counted against the reservation for nothing.
+            converted_sd = drop_unconsumed_quantization_sidecars(converted_sd)
+
+            quantized = install_int8_convrot_layers(
+                model,
+                converted_sd,
+                int8_markers,
+                torch.bfloat16,
+                architecture="FLUX.2",
+                reserve=self._ram_cache.make_room,
+                skip_patterns=skip_patterns,
+            )
+        else:
+            # The same reservation FLUX.1 makes above, and for the same reason: the split
+            # dequantizes its unusable subset through fp32, so reserving afterwards lets that
+            # transient land on an unreserved cache. This path had no reservation at all, which on
+            # a machine already holding the 15 GiB Qwen3-8B encoder meant nothing was ever evicted
+            # to make room for a 16.9 GiB bf16 Klein 9B.
+            reserve_for_load(
+                self._ram_cache.make_room,
+                converted_sd,
+                torch.bfloat16,
+                keep_fp8=keep_fp8,
+                model=model,
+                skip_patterns=skip_patterns,
+                fp8_layers=fp8_layers,
+                nvfp4_payloads={},
+            )
+
+            # Scaled layers the cast would dequantize anyway are folded here, scale applied, so
+            # `cast_state_dict` never strips a scale that can no longer be put back.
+            fp8_layers = split_fp8_scaled_layers(
+                converted_sd, fp8_layers, torch.bfloat16, model=model, skip_patterns=skip_patterns
+            )
+
+            kept = cast_state_dict(
+                converted_sd,
+                torch.bfloat16,
+                keep_fp8=keep_fp8,
+                model=model,
+                skip_patterns=skip_patterns,
+            )
+
+        # Load the state dict - guidance weights were already initialized above if missing
+        load_state_dict_ignoring_extras(model, converted_sd, source="FLUX.2 transformer checkpoint", assign=True)
+
+        if int8_markers:
+            # No setting behind this one and nothing to fall back to: `Int8ConvrotLinear` holds the
+            # stored codes and dequantizes per forward, so an 8.8 GiB file stays 8.8 GiB resident on
+            # every device. What it does not get is int8 *compute*.
+            self._logger.info(
+                f"FLUX.2: kept {len(quantized)} layer(s) in int8 (int8_tensorwise checkpoint, dequantized per forward)"
+            )
+            return model
+
+        if fp8_layers:
+            attached = attach_fp8_scales(model, fp8_layers)
+            self._logger.info(
+                f"FLUX.2: kept {attached} layer(s) in fp8 (scaled fp8 checkpoint, kept for {self._fp8_kept_reason()})"
+            )
+            warn_on_unattached_scales(self._logger, "FLUX.2", attached, fp8_layers)
+            marked = sum(1 for layer in fp8_layers.values() if layer.full_precision_matmul)
+            if marked and full_precision_hints_respected():
+                self._logger.info(
+                    f"FLUX.2: {marked} of {len(fp8_layers)} layer(s) are marked full_precision_matrix_mult "
+                    "and will dequantize per forward. Set fp8_compute_full_precision_hints=false to run "
+                    "them on the fp8 tensor cores instead."
+                )
+        elif kept:
+            self._logger.info(f"FLUX.2: kept {kept} raw fp8 weight(s) quantized ({self._fp8_kept_reason()}).")
+
+        return model
+
+    def _dequantize_fp8_weights(self, sd: dict, keep_fp8: bool = False) -> dict:
+        """Dequantize FP8 quantized weights in the state dict.
+
+        ComfyUI and some FLUX.2 models store quantized weights as:
+        - layer.weight: quantized FP8 data
+        - layer.weight_scale: scale factor (FP32 scalar or per-channel)
+
+        Dequantization formula: dequantized = weight.to(float) * weight_scale
+
+        Also handles FP8 tensors stored with float8_e4m3fn dtype by converting to float.
+
+        ``keep_fp8`` spares the *raw* fp8 weights (fp8 with no ``weight_scale``) that trailing
+        conversion, so they survive to `cast_state_dict` and reach the tensor cores. Without it this
+        method converts every float8 tensor unconditionally and nothing fp8 is left downstream — the
+        FLUX.2 half of the raw-fp8 path would never execute. Scaled weights are always folded here:
+        they have already had their scale applied a few lines up, so they are no longer float8 by
+        the time the loop below runs.
+
+        The test is deliberately the model-less form of :func:`can_stay_quantized` — the module tree
+        does not exist yet at this point, and the keys are still in checkpoint naming. It is a
+        superset: `cast_state_dict` re-applies the same predicate later *with* the model and casts
+        whatever turns out not to be an ``nn.Linear`` weight.
+        """
+        # Both spellings are folded here, because the metadata strip below removes both — reading
+        # only `.weight_scale` meant a `.scale_weight` checkpoint had its scales deleted without ever
+        # being applied, leaving every quantized weight off by 1/weight_scale with nothing logged.
+        #
+        # At the one call site this cannot fire: `extract_fp8_scaled_layers` runs first and takes
+        # every scale it is shown, so nothing with a pair reaches here. It stays as the safety net
+        # the call site calls it, but folds through the shared expansion now — the local copy that
+        # used to stand here got a per-output-channel scale wrong in the same way the Wan and
+        # Qwen-Image path did, and an unreachable branch carrying a live defect is the worst of both.
+        for weight_key, scale_key in list(iter_weight_scale_pairs(sd)):
+            weight = sd[weight_key].float()
+            scale = sd[scale_key].float()
+
+            # Multiply in float32 for precision, but store bf16 (FLUX.2's compute dtype) immediately
+            # so the *whole* model is never materialized in float32. Holding every dequantized weight
+            # as float32 here doubled RAM transiently (~36GB vs ~17GB for a 9B model) and was the
+            # dominant cold-load spike, especially with two GPUs.
+            sd[weight_key] = (weight * expand_weight_scale(weight, scale, weight_key)).to(torch.bfloat16)
+            del weight
+
+        # Filter out scale metadata keys and other FP8 metadata
+        keys_to_remove = [k for k in sd.keys() if is_scale_metadata_key(k)]
+        for k in keys_to_remove:
+            del sd[k]
+
+        # Handle native FP8 tensors (float8_e4m3fn dtype) that aren't already dequantized
+        # Also filter out 0-dimensional tensors (scalars) which are typically metadata
+        keys_to_convert = []
+        keys_to_remove_scalars = []
+        for key in list(sd.keys()):
+            tensor = sd[key]
+            if hasattr(tensor, "dim"):
+                if tensor.dim() == 0:
+                    # 0-dimensional tensor (scalar) - likely metadata, remove it
+                    keys_to_remove_scalars.append(key)
+                elif hasattr(tensor, "dtype") and "float8" in str(tensor.dtype):
+                    if keep_fp8 and can_stay_quantized(key, tensor, None):
+                        continue
+                    # Native FP8 tensor - mark for conversion
+                    keys_to_convert.append(key)
+
+        for k in keys_to_remove_scalars:
+            del sd[k]
+
+        for key in keys_to_convert:
+            # Convert native FP8 tensors straight to bf16 (FLUX.2's compute dtype) rather than float32,
+            # so a cold load never transiently holds the whole model in float32 (see the scaled path).
+            sd[key] = sd[key].to(torch.bfloat16)
+
+        return sd
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux2, type=ModelType.Main, format=ModelFormat.SDNQQuantized)
+class Flux2SDNQCheckpointModel(ModelLoader):
+    """Class to load SDNQ-quantized FLUX.2 transformer models (e.g. Klein 4B / 9B).
+
+    The checkpoint is expected to be in diffusers layout (i.e. the same key naming as
+    Flux2Transformer2DModel.state_dict()), since SDNQ tooling typically operates on
+    diffusers state dicts. BFL-layout SDNQ FLUX.2 checkpoints are not supported here.
+    """
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, (Main_SDNQ_Flux2_Config, Main_SDNQ_Diffusers_Flux2_Config)):
+            raise ValueError(
+                "Only Main_SDNQ_Flux2_Config or Main_SDNQ_Diffusers_Flux2_Config models are supported here."
+            )
+
+        # Single-file SDNQ FLUX.2 checkpoints only ship the transformer.
+        if isinstance(config, Main_SDNQ_Flux2_Config):
+            if submodel_type == SubModelType.Transformer:
+                return self._load_from_singlefile(config)
+            raise ValueError(
+                f"Single-file SDNQ FLUX.2 checkpoints only provide the Transformer submodel. "
+                f"Received: {submodel_type.value if submodel_type else 'None'}"
+            )
+
+        # Full Flux2 pipeline folder — dispatch each submodel from its own subfolder.
+        match submodel_type:
+            case SubModelType.Transformer:
+                return self._load_transformer_from_folder(config)
+            case SubModelType.TextEncoder:
+                return self._load_text_encoder(config)
+            case SubModelType.Tokenizer:
+                return self._load_tokenizer(config)
+            case SubModelType.VAE:
+                return self._load_vae(config)
+
+        raise ValueError(
+            f"Unsupported submodel type for SDNQ FLUX.2 pipeline: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+    def _load_transformer_from_folder(self, config: Main_SDNQ_Diffusers_Flux2_Config) -> AnyModel:
+        from diffusers import Flux2Transformer2DModel
+
+        model_path = Path(config.path)
+        transformer_path = resolve_submodel_path(
+            config,
+            SubModelType.Transformer,
+            model_path / "transformer" if (model_path / "transformer").is_dir() else model_path,
+        )
+
+        with accelerate.init_empty_weights():
+            model = Flux2Transformer2DModel.from_config(
+                Flux2Transformer2DModel.load_config(transformer_path, local_files_only=True)
+            )
+
+        sd = sdnq_sd_loader(transformer_path, compute_dtype=torch.bfloat16)
+        # The FLUX.2 transformer has no tied weights, so we expect a complete state dict — a missing
+        # key means a required parameter is left on the meta device and would fail later.
+        missing, unexpected = model.load_state_dict(sd, assign=True, strict=False)
+        raise_on_incomplete_sdnq_load("SDNQ FLUX.2 transformer", missing, unexpected)
+        return model
+
+    def _load_text_encoder(self, config: Main_SDNQ_Diffusers_Flux2_Config) -> AnyModel:
+        from transformers import AutoConfig, Qwen3ForCausalLM
+
+        te_dir = resolve_submodel_path(config, SubModelType.TextEncoder, Path(config.path) / "text_encoder")
+        te_config = AutoConfig.from_pretrained(te_dir, local_files_only=True)
+        with accelerate.init_empty_weights():
+            model = Qwen3ForCausalLM(te_config)
+
+        sd = sdnq_sd_loader(te_dir, compute_dtype=torch.bfloat16)
+        missing = load_state_dict_ignoring_extras(
+            model, sd, source="SDNQ Qwen3 text encoder", assign=True, allowed_missing={"lm_head.weight"}
+        )
+        if missing == ["lm_head.weight"]:
+            model.lm_head.weight = model.model.embed_tokens.weight
+        return model
+
+    def _load_tokenizer(self, config: Main_SDNQ_Diffusers_Flux2_Config) -> AnyModel:
+        from transformers import AutoTokenizer
+
+        tok_dir = resolve_submodel_path(config, SubModelType.Tokenizer, Path(config.path) / "tokenizer")
+        return AutoTokenizer.from_pretrained(tok_dir, local_files_only=True)
+
+    def _load_vae(self, config: Main_SDNQ_Diffusers_Flux2_Config) -> AnyModel:
+        # FLUX.2 Klein uses AutoencoderKLFlux2 (not the generic AutoencoderKL). Both ship as
+        # plain bf16 in this pipeline (the VAE itself isn't SDNQ-quantized).
+        from diffusers import AutoencoderKL, AutoencoderKLFlux2
+
+        vae_dir = resolve_submodel_path(config, SubModelType.VAE, Path(config.path) / "vae")
+        # Pick the right class based on what the on-disk config.json declares.
+        try:
+            cls_name = AutoencoderKL.load_config(vae_dir, local_files_only=True).get("_class_name", "")
+        except Exception:
+            cls_name = ""
+        if cls_name == "AutoencoderKLFlux2":
+            return AutoencoderKLFlux2.from_pretrained(vae_dir, local_files_only=True)
+        return AutoencoderKL.from_pretrained(vae_dir, local_files_only=True)
+
+    def _load_from_singlefile(self, config: Main_SDNQ_Flux2_Config) -> AnyModel:
+        from diffusers import Flux2Transformer2DModel
+
+        model_path = Path(config.path)
+
+        sd = sdnq_sd_loader(model_path, compute_dtype=torch.bfloat16)
+
+        # Detect architecture from state dict shapes. SDNQTensor.shape returns the
+        # *dequantized* shape, so this works identically to the fp16 path.
+        double_block_indices = [
+            int(k.split(".")[1]) for k in sd.keys() if isinstance(k, str) and k.startswith("transformer_blocks.")
+        ]
+        single_block_indices = [
+            int(k.split(".")[1]) for k in sd.keys() if isinstance(k, str) and k.startswith("single_transformer_blocks.")
+        ]
+        num_layers = max(double_block_indices) + 1 if double_block_indices else 5
+        num_single_layers = max(single_block_indices) + 1 if single_block_indices else 20
+
+        context_embedder_weight = sd.get("context_embedder.weight")
+        if context_embedder_weight is not None:
+            hidden_size = context_embedder_weight.shape[0]
+            joint_attention_dim = context_embedder_weight.shape[1]
+        else:
+            hidden_size = 3072
+            joint_attention_dim = 7680
+
+        x_embedder_weight = sd.get("x_embedder.weight")
+        in_channels = x_embedder_weight.shape[1] if x_embedder_weight is not None else 128
+
+        attention_head_dim = 128
+        num_attention_heads = hidden_size // attention_head_dim
+
+        has_guidance = "time_guidance_embed.guidance_embedder.linear_1.weight" in sd
+
+        with SilenceWarnings():
+            with accelerate.init_empty_weights():
+                model = Flux2Transformer2DModel(
+                    in_channels=in_channels,
+                    out_channels=in_channels,
+                    num_layers=num_layers,
+                    num_single_layers=num_single_layers,
+                    attention_head_dim=attention_head_dim,
+                    num_attention_heads=num_attention_heads,
+                    joint_attention_dim=joint_attention_dim,
+                    patch_size=1,
+                )
+
+        # Klein variants ship without guidance embeddings — zero-fill from the timestep
+        # embedder dimensions so load_state_dict has a tensor for those slots.
+        if not has_guidance:
+            timestep_linear1 = sd.get("time_guidance_embed.timestep_embedder.linear_1.weight")
+            if timestep_linear1 is not None:
+                out_features, in_features = timestep_linear1.shape[0], timestep_linear1.shape[1]
+                sd["time_guidance_embed.guidance_embedder.linear_1.weight"] = torch.zeros(
+                    out_features, in_features, dtype=torch.bfloat16
+                )
+                timestep_linear2 = sd.get("time_guidance_embed.timestep_embedder.linear_2.weight")
+                if timestep_linear2 is not None:
+                    out2, in2 = timestep_linear2.shape[0], timestep_linear2.shape[1]
+                    sd["time_guidance_embed.guidance_embedder.linear_2.weight"] = torch.zeros(
+                        out2, in2, dtype=torch.bfloat16
+                    )
+
+        load_state_dict_ignoring_extras(model, sd, source="SDNQ FLUX.2 transformer checkpoint", assign=True)
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux2, type=ModelType.Main, format=ModelFormat.GGUFQuantized)
+class Flux2GGUFCheckpointModel(ModelLoader):
+    """Class to load GGUF-quantized FLUX.2 transformer models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, Main_GGUF_Flux2_Config):
+            raise ValueError("Only Main_GGUF_Flux2_Config models are currently supported here.")
+
+        match submodel_type:
+            case SubModelType.Transformer:
+                return self._load_from_singlefile(config)
+
+        raise ValueError(
+            f"Only Transformer submodels are currently supported. Received: {submodel_type.value if submodel_type else 'None'}"
+        )
+
+    def _load_from_singlefile(
+        self,
+        config: Main_GGUF_Flux2_Config,
+    ) -> AnyModel:
+        from diffusers import Flux2Transformer2DModel
+
+        model_path = Path(config.path)
+
+        # Load GGUF state dict
+        sd = gguf_sd_loader(model_path, compute_dtype=torch.bfloat16)
+
+        # Check if keys have ComfyUI-style prefix and strip if needed
+        sd = CheckpointPrefix.detect(sd).strip(sd)
+
+        # Convert BFL format state dict to diffusers format
+        converted_sd = convert_flux2_bfl_to_diffusers(sd)
+
+        # Detect architecture from checkpoint keys
+        double_block_indices = [
+            int(k.split(".")[1])
+            for k in converted_sd.keys()
+            if isinstance(k, str) and k.startswith("transformer_blocks.")
+        ]
+        single_block_indices = [
+            int(k.split(".")[1])
+            for k in converted_sd.keys()
+            if isinstance(k, str) and k.startswith("single_transformer_blocks.")
+        ]
+
+        num_layers = max(double_block_indices) + 1 if double_block_indices else 5
+        num_single_layers = max(single_block_indices) + 1 if single_block_indices else 20
+
+        # Get dimensions from weights
+        # context_embedder.weight shape: [hidden_size, joint_attention_dim]
+        context_embedder_weight = converted_sd.get("context_embedder.weight")
+        if context_embedder_weight is not None:
+            if hasattr(context_embedder_weight, "tensor_shape"):
+                hidden_size = context_embedder_weight.tensor_shape[0]
+                joint_attention_dim = context_embedder_weight.tensor_shape[1]
+            else:
+                hidden_size = context_embedder_weight.shape[0]
+                joint_attention_dim = context_embedder_weight.shape[1]
+        else:
+            # Default to Klein 4B dimensions
+            hidden_size = 3072
+            joint_attention_dim = 7680
+
+        x_embedder_weight = converted_sd.get("x_embedder.weight")
+        if x_embedder_weight is not None:
+            in_channels = (
+                x_embedder_weight.tensor_shape[1]
+                if hasattr(x_embedder_weight, "tensor_shape")
+                else x_embedder_weight.shape[1]
+            )
+        else:
+            in_channels = 128
+
+        # Calculate num_attention_heads from hidden_size
+        # Klein 4B: hidden_size=3072, num_attention_heads=24 (3072/128=24)
+        # Klein 9B: hidden_size=4096, num_attention_heads=32 (4096/128=32)
+        attention_head_dim = 128
+        num_attention_heads = hidden_size // attention_head_dim
+
+        # Klein models don't have guidance embeddings - check if they're in the checkpoint
+        has_guidance = "time_guidance_embed.guidance_embedder.linear_1.weight" in converted_sd
+
+        # Create model with detected configuration
+        with SilenceWarnings():
+            with accelerate.init_empty_weights():
+                model = Flux2Transformer2DModel(
+                    in_channels=in_channels,
+                    out_channels=in_channels,
+                    num_layers=num_layers,
+                    num_single_layers=num_single_layers,
+                    attention_head_dim=attention_head_dim,
+                    num_attention_heads=num_attention_heads,
+                    joint_attention_dim=joint_attention_dim,
+                    patch_size=1,
+                )
+
+        # If Klein model without guidance, initialize guidance embedder with zeros
+        if not has_guidance:
+            timestep_linear1 = converted_sd.get("time_guidance_embed.timestep_embedder.linear_1.weight")
+            if timestep_linear1 is not None:
+                in_features = (
+                    timestep_linear1.tensor_shape[1]
+                    if hasattr(timestep_linear1, "tensor_shape")
+                    else timestep_linear1.shape[1]
+                )
+                out_features = (
+                    timestep_linear1.tensor_shape[0]
+                    if hasattr(timestep_linear1, "tensor_shape")
+                    else timestep_linear1.shape[0]
+                )
+                converted_sd["time_guidance_embed.guidance_embedder.linear_1.weight"] = torch.zeros(
+                    out_features, in_features, dtype=torch.bfloat16
+                )
+                timestep_linear2 = converted_sd.get("time_guidance_embed.timestep_embedder.linear_2.weight")
+                if timestep_linear2 is not None:
+                    in_features2 = (
+                        timestep_linear2.tensor_shape[1]
+                        if hasattr(timestep_linear2, "tensor_shape")
+                        else timestep_linear2.shape[1]
+                    )
+                    out_features2 = (
+                        timestep_linear2.tensor_shape[0]
+                        if hasattr(timestep_linear2, "tensor_shape")
+                        else timestep_linear2.shape[0]
+                    )
+                    converted_sd["time_guidance_embed.guidance_embedder.linear_2.weight"] = torch.zeros(
+                        out_features2, in_features2, dtype=torch.bfloat16
+                    )
+
+        load_state_dict_ignoring_extras(model, converted_sd, source="FLUX.2 GGUF transformer checkpoint", assign=True)
+        return model
+
+
+_FLUX_CONTROLNET_FP8_STORAGE = Unimplemented(
+    "neither the XLabs nor the InstantX path casts -- they do not even move the adapter to a compute dtype -- "
+    "and the InstantX union build is a full FLUX transformer, so the gap is worth closing"
+)
+"""Both registrations below say this; naming it once keeps the two from drifting apart."""
+
+
+@ModelLoaderRegistry.register(
+    base=BaseModelType.Flux,
+    type=ModelType.ControlNet,
+    format=ModelFormat.Checkpoint,
+    fp8_storage=_FLUX_CONTROLNET_FP8_STORAGE,
+)
+@ModelLoaderRegistry.register(
+    base=BaseModelType.Flux,
+    type=ModelType.ControlNet,
+    format=ModelFormat.Diffusers,
+    fp8_storage=_FLUX_CONTROLNET_FP8_STORAGE,
+)
+class FluxControlnetModel(ModelLoader):
+    """Class to load FLUX ControlNet models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if isinstance(config, ControlNet_Checkpoint_Config_Base):
+            model_path = Path(config.path)
+        elif isinstance(config, ControlNet_Diffusers_Config_Base):
+            # If this is a diffusers directory, we simply ignore the config file and load from the weight file.
+            model_path = Path(config.path) / "diffusion_pytorch_model.safetensors"
+        else:
+            raise ValueError(f"Unexpected ControlNet model config type: {type(config)}")
+
+        sd = load_file(model_path)
+
+        # Detect the FLUX ControlNet model type from the state dict.
+        if is_state_dict_xlabs_controlnet(sd):
+            return self._load_xlabs_controlnet(sd)
+        elif is_state_dict_instantx_controlnet(sd):
+            return self._load_instantx_controlnet(sd)
+        else:
+            raise ValueError("Do not recognize the state dict as an XLabs or InstantX ControlNet model.")
+
+    def _load_xlabs_controlnet(self, sd: dict[str, torch.Tensor]) -> AnyModel:
+        with accelerate.init_empty_weights():
+            # HACK(ryand): Is it safe to assume dev here?
+            model = XLabsControlNetFlux(get_flux_transformers_params(FluxVariantType.Dev))
+
+        load_state_dict_ignoring_extras(model, sd, source="FLUX XLabs ControlNet checkpoint", assign=True)
+        return model
+
+    def _load_instantx_controlnet(self, sd: dict[str, torch.Tensor]) -> AnyModel:
+        sd = convert_diffusers_instantx_state_dict_to_bfl_format(sd)
+        flux_params = infer_flux_params_from_state_dict(sd)
+        num_control_modes = infer_instantx_num_control_modes_from_state_dict(sd)
+
+        with accelerate.init_empty_weights():
+            model = InstantXControlNetFlux(flux_params, num_control_modes)
+
+        load_state_dict_ignoring_extras(model, sd, source="FLUX InstantX ControlNet checkpoint", assign=True)
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux, type=ModelType.IPAdapter, format=ModelFormat.Checkpoint)
+class FluxIpAdapterModel(ModelLoader):
+    """Class to load FLUX IP-Adapter models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, IPAdapter_Checkpoint_Config_Base):
+            raise ValueError(f"Unexpected model config type: {type(config)}.")
+
+        sd = load_file(Path(config.path))
+
+        params = infer_xlabs_ip_adapter_params_from_state_dict(sd)
+
+        with accelerate.init_empty_weights():
+            model = XlabsIpAdapterFlux(params=params)
+
+        model.load_xlabs_state_dict(sd, assign=True)
+        return model
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux, type=ModelType.FluxRedux, format=ModelFormat.Checkpoint)
+class FluxReduxModelLoader(ModelLoader):
+    """Class to load FLUX Redux models."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        if not isinstance(config, FLUXRedux_Checkpoint_Config):
+            raise ValueError(f"Unexpected model config type: {type(config)}.")
+
+        sd = load_file(Path(config.path))
+
+        with accelerate.init_empty_weights():
+            model = FluxReduxModel()
+
+        load_state_dict_ignoring_extras(model, sd, source="FLUX Redux checkpoint", assign=True)
+        model.to(dtype=torch.bfloat16)
+        return model
+
+
+# Re-exported from the shared detector: the loader's dispatch and identification must agree about
+# what counts as an SDNQ folder, including markerless exports.
+_is_sdnq_folder = is_sdnq_folder
+
+
+@ModelLoaderRegistry.register(base=BaseModelType.Flux, type=ModelType.Main, format=ModelFormat.SDNQQuantized)
+class FluxSDNQDiffusersModel(ModelLoader):
+    """Class to load SDNQ-quantized Flux models in diffusers format."""
+
+    def _load_model(
+        self,
+        config: AnyModelConfig,
+        submodel_type: Optional[SubModelType] = None,
+    ) -> AnyModel:
+        logger.debug(
+            "[SDNQ] FluxSDNQDiffusersModel._load_model called with config=%s, submodel=%s",
+            type(config).__name__,
+            submodel_type,
+        )
+        # Handle single-file SDNQ checkpoint (Main_SDNQ_FLUX_Config)
+        if isinstance(config, Main_SDNQ_FLUX_Config):
+            if submodel_type == SubModelType.Transformer:
+                return self._load_sdnq_transformer_checkpoint(config)
+            raise ValueError(
+                f"Only Transformer submodels are supported for checkpoint format. Received: {submodel_type}"
+            )
+
+        # Handle diffusers-format SDNQ model (Main_SDNQ_Diffusers_FLUX_Config)
+        if not isinstance(config, Main_SDNQ_Diffusers_FLUX_Config):
+            raise ValueError(f"Expected Main_SDNQ_Diffusers_FLUX_Config, got {type(config).__name__}")
+
+        if submodel_type is None:
+            raise ValueError("A submodel type must be provided when loading main pipelines.")
+
+        # Prefer the path discovery actually found. `model_index.json` names its components with
+        # arbitrary keys, and identification records the key it saw — but reconstructing
+        # `model_path / submodel_type.value` here assumes the key always equals the slot name. A
+        # pipeline whose index calls its CLIP encoder something else is then discovered fine and
+        # loaded from a folder that does not exist. Fall back to the conventional name when a config
+        # predates submodel discovery.
+        model_path = Path(config.path)
+        submodel_path = resolve_submodel_path(config, submodel_type, model_path / submodel_type.value)
+
+        # These branches build their modules by hand (`init_empty_weights` + `load_state_dict`)
+        # rather than through `from_pretrained`, so they arrive in training mode — `put_in_eval_mode`
+        # in `load_default._load_and_cache` is what puts every loaded model into inference mode.
+        match submodel_type:
+            case SubModelType.Transformer:
+                return self._load_sdnq_transformer(submodel_path, config)
+            case SubModelType.TextEncoder:
+                return self._load_text_encoder(submodel_path)
+            case SubModelType.TextEncoder2:
+                return self._load_text_encoder_2(submodel_path)
+            case SubModelType.Tokenizer:
+                return CLIPTokenizer.from_pretrained(submodel_path, local_files_only=True)
+            case SubModelType.Tokenizer2:
+                return T5Tokenizer.from_pretrained(submodel_path, max_length=512, local_files_only=True)
+            case SubModelType.VAE:
+                return self._load_vae(submodel_path)
+            case _:
+                raise ValueError(f"Unsupported submodel type: {submodel_type}")
+
+    def _load_sdnq_transformer_checkpoint(self, config: Main_SDNQ_FLUX_Config) -> AnyModel:
+        """Load SDNQ transformer from single-file checkpoint."""
+        model_path = Path(config.path)
+
+        with accelerate.init_empty_weights():
+            model = Flux(get_flux_transformers_params(config.variant))
+
+        sd = sdnq_sd_loader(model_path, compute_dtype=torch.bfloat16)
+
+        # Handle ComfyUI bundle format
+        if "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.scale" in sd:
+            sd = convert_bundle_to_flux_transformer_checkpoint(sd)
+
+        load_state_dict_ignoring_extras(model, sd, source="SDNQ FLUX transformer checkpoint", assign=True)
+        return model
+
+    def _load_sdnq_transformer(self, transformer_path: Path, config: Main_SDNQ_Diffusers_FLUX_Config) -> AnyModel:
+        """Load SDNQ-quantized transformer from diffusers folder."""
+        logger.debug("[SDNQ] _load_sdnq_transformer called for %s", transformer_path)
+        with accelerate.init_empty_weights():
+            model = Flux(get_flux_transformers_params(config.variant))
+
+        sd = sdnq_sd_loader(transformer_path, compute_dtype=torch.bfloat16)
+
+        # Convert from diffusers format to BFL format
+        sd = self._convert_diffusers_sd_to_bfl(sd)
+
+        load_state_dict_ignoring_extras(model, sd, source="SDNQ FLUX transformer", assign=True)
+        return model
+
+    def _convert_diffusers_sd_to_bfl(self, sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Convert a Flux transformer state dict from diffusers format to BFL format.
+
+        Note: For SDNQTensor objects, Q/K/V tensors are dequantized before fusion since
+        torch.cat doesn't work with quantized tensors. Other layers retain quantization.
+        """
+        from invokeai.backend.quantization.sdnq.sdnq_tensor import SDNQTensor
+
+        # Helper to dequantize SDNQTensor or return as-is
+        def maybe_dequantize(t: torch.Tensor) -> torch.Tensor:
+            if isinstance(t, SDNQTensor):
+                return t.get_dequantized_tensor()
+            return t
+
+        # Helper to fuse weights, handling SDNQTensor
+        def fuse_weights(*tensors: torch.Tensor) -> torch.Tensor:
+            dequantized = [maybe_dequantize(t) for t in tensors]
+            return torch.cat(dequantized, dim=0)
+
+        def _swap_scale_shift_halves(t: torch.Tensor) -> torch.Tensor:
+            """Swap the (scale, shift) halves along dim 0 to (shift, scale).
+
+            diffusers' AdaLayerNormContinuous packs (scale, shift); BFL's LastLayer expects
+            (shift, scale). Same memory, different interpretation — without this swap the final
+            normalisation modulation is permuted and the output is high-frequency noise.
+            """
+            t = maybe_dequantize(t)
+            if t.dim() < 1 or t.shape[0] % 2 != 0:
+                return t
+            scale, shift = t.chunk(2, dim=0)
+            return torch.cat([shift, scale], dim=0)
+
+        # Make a shallow copy so we can pop keys
+        sd = sd.copy()
+        new_sd: dict[str, torch.Tensor] = {}
+
+        # Basic 1-to-1 key conversions
+        basic_key_map = {
+            # txt_in keys
+            "context_embedder.bias": "txt_in.bias",
+            "context_embedder.weight": "txt_in.weight",
+            # guidance_in MLPEmbedder keys
+            "time_text_embed.guidance_embedder.linear_1.bias": "guidance_in.in_layer.bias",
+            "time_text_embed.guidance_embedder.linear_1.weight": "guidance_in.in_layer.weight",
+            "time_text_embed.guidance_embedder.linear_2.bias": "guidance_in.out_layer.bias",
+            "time_text_embed.guidance_embedder.linear_2.weight": "guidance_in.out_layer.weight",
+            # vector_in MLPEmbedder keys
+            "time_text_embed.text_embedder.linear_1.bias": "vector_in.in_layer.bias",
+            "time_text_embed.text_embedder.linear_1.weight": "vector_in.in_layer.weight",
+            "time_text_embed.text_embedder.linear_2.bias": "vector_in.out_layer.bias",
+            "time_text_embed.text_embedder.linear_2.weight": "vector_in.out_layer.weight",
+            # time_in MLPEmbedder keys
+            "time_text_embed.timestep_embedder.linear_1.bias": "time_in.in_layer.bias",
+            "time_text_embed.timestep_embedder.linear_1.weight": "time_in.in_layer.weight",
+            "time_text_embed.timestep_embedder.linear_2.bias": "time_in.out_layer.bias",
+            "time_text_embed.timestep_embedder.linear_2.weight": "time_in.out_layer.weight",
+            # img_in keys
+            "x_embedder.bias": "img_in.bias",
+            "x_embedder.weight": "img_in.weight",
+            # final_layer keys
+            "proj_out.bias": "final_layer.linear.bias",
+            "proj_out.weight": "final_layer.linear.weight",
+            # norm_out.linear is the final AdaLayerNormContinuous. diffusers packs the linear
+            # output as (scale, shift); BFL's LastLayer packs as (shift, scale). Swap the
+            # halves of the weight and bias to keep the math correct.
+            "norm_out.linear.bias": "final_layer.adaLN_modulation.1.bias",
+            "norm_out.linear.weight": "final_layer.adaLN_modulation.1.weight",
+        }
+        # Keys whose first-axis halves (scale, shift) must be swapped to (shift, scale) for BFL.
+        SWAP_SCALE_SHIFT_KEYS = {
+            "norm_out.linear.bias",
+            "norm_out.linear.weight",
+        }
+        for old_key, new_key in basic_key_map.items():
+            v = sd.pop(old_key, None)
+            if v is not None:
+                if old_key in SWAP_SCALE_SHIFT_KEYS:
+                    v = _swap_scale_shift_halves(v)
+                new_sd[new_key] = v
+
+        # Handle the double_blocks (19 blocks for FLUX)
+        block_index = 0
+        while f"transformer_blocks.{block_index}.attn.add_q_proj.bias" in sd:
+            from_prefix = f"transformer_blocks.{block_index}"
+            to_prefix = f"double_blocks.{block_index}"
+
+            # txt_attn.qkv (fuse add_q, add_k, add_v)
+            new_sd[f"{to_prefix}.txt_attn.qkv.bias"] = fuse_weights(
+                sd.pop(f"{from_prefix}.attn.add_q_proj.bias"),
+                sd.pop(f"{from_prefix}.attn.add_k_proj.bias"),
+                sd.pop(f"{from_prefix}.attn.add_v_proj.bias"),
+            )
+            new_sd[f"{to_prefix}.txt_attn.qkv.weight"] = fuse_weights(
+                sd.pop(f"{from_prefix}.attn.add_q_proj.weight"),
+                sd.pop(f"{from_prefix}.attn.add_k_proj.weight"),
+                sd.pop(f"{from_prefix}.attn.add_v_proj.weight"),
+            )
+
+            # img_attn.qkv (fuse to_q, to_k, to_v)
+            new_sd[f"{to_prefix}.img_attn.qkv.bias"] = fuse_weights(
+                sd.pop(f"{from_prefix}.attn.to_q.bias"),
+                sd.pop(f"{from_prefix}.attn.to_k.bias"),
+                sd.pop(f"{from_prefix}.attn.to_v.bias"),
+            )
+            new_sd[f"{to_prefix}.img_attn.qkv.weight"] = fuse_weights(
+                sd.pop(f"{from_prefix}.attn.to_q.weight"),
+                sd.pop(f"{from_prefix}.attn.to_k.weight"),
+                sd.pop(f"{from_prefix}.attn.to_v.weight"),
+            )
+
+            # 1-to-1 key mappings for double block
+            double_block_key_map = {
+                # img_attn
+                "attn.norm_k.weight": "img_attn.norm.key_norm.scale",
+                "attn.norm_q.weight": "img_attn.norm.query_norm.scale",
+                "attn.to_out.0.weight": "img_attn.proj.weight",
+                "attn.to_out.0.bias": "img_attn.proj.bias",
+                # img_mlp
+                "ff.net.0.proj.weight": "img_mlp.0.weight",
+                "ff.net.0.proj.bias": "img_mlp.0.bias",
+                "ff.net.2.weight": "img_mlp.2.weight",
+                "ff.net.2.bias": "img_mlp.2.bias",
+                # img_mod
+                "norm1.linear.weight": "img_mod.lin.weight",
+                "norm1.linear.bias": "img_mod.lin.bias",
+                # txt_attn
+                "attn.norm_added_q.weight": "txt_attn.norm.query_norm.scale",
+                "attn.norm_added_k.weight": "txt_attn.norm.key_norm.scale",
+                "attn.to_add_out.weight": "txt_attn.proj.weight",
+                "attn.to_add_out.bias": "txt_attn.proj.bias",
+                # txt_mlp
+                "ff_context.net.0.proj.weight": "txt_mlp.0.weight",
+                "ff_context.net.0.proj.bias": "txt_mlp.0.bias",
+                "ff_context.net.2.weight": "txt_mlp.2.weight",
+                "ff_context.net.2.bias": "txt_mlp.2.bias",
+                # txt_mod
+                "norm1_context.linear.weight": "txt_mod.lin.weight",
+                "norm1_context.linear.bias": "txt_mod.lin.bias",
+            }
+            for from_key, to_key in double_block_key_map.items():
+                v = sd.pop(f"{from_prefix}.{from_key}", None)
+                if v is not None:
+                    new_sd[f"{to_prefix}.{to_key}"] = v
+
+            block_index += 1
+
+        # Handle the single_blocks (38 blocks for FLUX)
+        block_index = 0
+        while f"single_transformer_blocks.{block_index}.attn.to_q.bias" in sd:
+            from_prefix = f"single_transformer_blocks.{block_index}"
+            to_prefix = f"single_blocks.{block_index}"
+
+            # linear1 (fuse to_q, to_k, to_v, proj_mlp)
+            new_sd[f"{to_prefix}.linear1.bias"] = fuse_weights(
+                sd.pop(f"{from_prefix}.attn.to_q.bias"),
+                sd.pop(f"{from_prefix}.attn.to_k.bias"),
+                sd.pop(f"{from_prefix}.attn.to_v.bias"),
+                sd.pop(f"{from_prefix}.proj_mlp.bias"),
+            )
+            new_sd[f"{to_prefix}.linear1.weight"] = fuse_weights(
+                sd.pop(f"{from_prefix}.attn.to_q.weight"),
+                sd.pop(f"{from_prefix}.attn.to_k.weight"),
+                sd.pop(f"{from_prefix}.attn.to_v.weight"),
+                sd.pop(f"{from_prefix}.proj_mlp.weight"),
+            )
+
+            # 1-to-1 key mappings for single block
+            single_block_key_map = {
+                # linear2
+                "proj_out.weight": "linear2.weight",
+                "proj_out.bias": "linear2.bias",
+                # modulation
+                "norm.linear.weight": "modulation.lin.weight",
+                "norm.linear.bias": "modulation.lin.bias",
+                # norm
+                "attn.norm_k.weight": "norm.key_norm.scale",
+                "attn.norm_q.weight": "norm.query_norm.scale",
+            }
+            for from_key, to_key in single_block_key_map.items():
+                v = sd.pop(f"{from_prefix}.{from_key}", None)
+                if v is not None:
+                    new_sd[f"{to_prefix}.{to_key}"] = v
+
+            block_index += 1
+
+        # Any remaining keys that weren't converted - just pass through
+        for k, v in sd.items():
+            if k not in new_sd:
+                new_sd[k] = v
+
+        return new_sd
+
+    def _load_text_encoder(self, text_encoder_path: Path) -> AnyModel:
+        """Load text encoder (CLIP) - SDNQ or normal."""
+        if _is_sdnq_folder(text_encoder_path):
+            # SDNQ CLIP - need custom loading
+            return self._load_sdnq_clip(text_encoder_path)
+        # Normal CLIP
+        return CLIPTextModel.from_pretrained(text_encoder_path, local_files_only=True)
+
+    def _load_text_encoder_2(self, text_encoder_path: Path) -> AnyModel:
+        """Load text encoder 2 (T5) - SDNQ or normal."""
+        if _is_sdnq_folder(text_encoder_path):
+            # SDNQ T5 - need custom loading
+            return self._load_sdnq_t5(text_encoder_path)
+        # Normal T5
+        return T5EncoderModel.from_pretrained(
+            text_encoder_path,
+            torch_dtype="auto",
+            low_cpu_mem_usage=True,
+            local_files_only=True,
+        )
+
+    def _load_sdnq_clip(self, clip_path: Path) -> AnyModel:
+        """Load SDNQ-quantized CLIP text encoder."""
+        from invokeai.backend.quantization.sdnq.sdnq_tensor import SDNQTensor
+
+        # Load SDNQ state dict
+        sd = sdnq_sd_loader(clip_path, compute_dtype=torch.bfloat16)
+
+        # Load config and create model
+        model_config = AutoConfig.from_pretrained(clip_path, local_files_only=True)
+        with accelerate.init_empty_weights():
+            model = CLIPTextModel(model_config)
+
+        # transformers >=5.6 flattened CLIPTextModel, dropping the `text_model.` prefix the checkpoint carries.
+        # (`from_pretrained` strips it with a conversion rule; `load_state_dict` does not.)
+        sd = {k.removeprefix("text_model."): v for k, v in sd.items()}
+
+        # position_ids is a non-persistent buffer that may be absent from the checkpoint.
+        missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
+        raise_on_incomplete_sdnq_load(
+            "SDNQ CLIP text encoder", missing, unexpected, allowed_missing={"embeddings.position_ids"}
+        )
+
+        # Dequantize embedding layer
+        embed_weight = model.embeddings.token_embedding.weight
+        if isinstance(embed_weight, SDNQTensor):
+            model.embeddings.token_embedding.weight = torch.nn.Parameter(
+                embed_weight.get_dequantized_tensor(), requires_grad=False
+            )
+
+        return model
+
+    def _load_sdnq_t5(self, t5_path: Path) -> AnyModel:
+        """Load SDNQ-quantized T5 text encoder."""
+        from invokeai.backend.quantization.sdnq.sdnq_tensor import SDNQTensor
+
+        # Load SDNQ state dict
+        sd = sdnq_sd_loader(t5_path, compute_dtype=torch.bfloat16)
+
+        # Load config and create model
+        model_config = AutoConfig.from_pretrained(t5_path, local_files_only=True)
+        with accelerate.init_empty_weights():
+            model = AutoModelForTextEncoding.from_config(model_config)
+
+        # T5 ties encoder.embed_tokens to shared; the checkpoint only ships `shared.weight` and the
+        # tie is re-established below, so encoder.embed_tokens.weight is expected to be missing.
+        missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
+        raise_on_incomplete_sdnq_load(
+            "SDNQ T5 text encoder", missing, unexpected, allowed_missing={"encoder.embed_tokens.weight"}
+        )
+
+        # Dequantize shared embedding
+        if hasattr(model, "shared") and isinstance(model.shared.weight, SDNQTensor):
+            dequantized = model.shared.weight.get_dequantized_tensor()
+            model.shared.weight = torch.nn.Parameter(dequantized, requires_grad=False)
+
+        # Re-tie weights after dequantization
+        if hasattr(model, "encoder") and hasattr(model.encoder, "embed_tokens"):
+            if model.encoder.embed_tokens.weight is not model.shared.weight:
+                model.encoder.embed_tokens.weight = model.shared.weight
+
+        return model
+
+    def _load_vae(self, vae_path: Path) -> AnyModel:
+        """Load VAE - SDNQ or normal."""
+        if _is_sdnq_folder(vae_path):
+            return self._load_sdnq_vae(vae_path)
+        # Normal VAE
+        return AutoencoderKL.from_pretrained(vae_path, local_files_only=True)
+
+    def _load_sdnq_vae(self, vae_path: Path) -> AnyModel:
+        """Load SDNQ-quantized VAE."""
+        # Load SDNQ state dict
+        sd = sdnq_sd_loader(vae_path, compute_dtype=torch.bfloat16)
+
+        # Load config and create model
+        with accelerate.init_empty_weights():
+            model = AutoencoderKL.from_config(AutoencoderKL.load_config(vae_path, local_files_only=True))
+
+        # AutoencoderKL has no tied weights, so a complete state dict is expected.
+        missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
+        raise_on_incomplete_sdnq_load("SDNQ VAE", missing, unexpected)
+        return model

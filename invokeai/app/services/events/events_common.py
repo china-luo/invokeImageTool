@@ -1,0 +1,1199 @@
+from typing import TYPE_CHECKING, Any, ClassVar, Coroutine, Generic, Literal, Optional, Protocol, TypeAlias, TypeVar
+
+from fastapi_events.handlers.local import local_handler
+from fastapi_events.registry.payload_schema import registry as payload_schema
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from invokeai.app.services.image_records.image_records_common import ImageCategory
+from invokeai.app.services.intermediates.intermediates_common import IntermediatesOperation
+from invokeai.app.services.model_install.model_install_common import ModelInstallJob, ModelSource
+from invokeai.app.services.session_processor.session_processor_common import ProgressImage
+from invokeai.app.services.session_queue.session_queue_common import (
+    QUEUE_ITEM_STATUS,
+    BatchStatus,
+    EnqueueBatchResult,
+    RetriedQueueItem,
+    RetryItemsResult,
+    SessionQueueItem,
+    SessionQueueStatus,
+)
+from invokeai.app.services.shared.graph import AnyInvocation, AnyInvocationOutput
+from invokeai.app.util.misc import get_timestamp
+from invokeai.backend.model_manager.configs.factory import AnyModelConfig
+from invokeai.backend.model_manager.taxonomy import SubModelType
+
+if TYPE_CHECKING:
+    from invokeai.app.services.download.download_base import DownloadJob
+    from invokeai.app.services.model_install.model_install_common import ModelInstallJob, ModelSource
+
+
+class EventBase(BaseModel):
+    """Base class for all events. All events must inherit from this class.
+
+    Events must define a class attribute `__event_name__` to identify the event.
+
+    All other attributes should be defined as normal for a pydantic model.
+
+    A timestamp is automatically added to the event when it is created.
+
+    Events that are dispatched only within the server and never reach clients should set
+    `__server_internal__ = True` to keep themselves out of the generated API schema.
+    """
+
+    __event_name__: ClassVar[str]
+    __server_internal__: ClassVar[bool] = False
+    timestamp: int = Field(description="The timestamp of the event", default_factory=get_timestamp)
+
+    model_config = ConfigDict(json_schema_serialization_defaults_required=True)
+
+    @classmethod
+    def get_events(cls) -> set[type["EventBase"]]:
+        """Get a set of all client-facing event models.
+
+        Consumed by the OpenAPI generator, so server-internal events are excluded — they
+        are not part of the client API surface.
+        """
+
+        event_subclasses: set[type["EventBase"]] = set()
+        for subclass in cls.__subclasses__():
+            # We only want to include subclasses that are event models, not intermediary classes
+            if hasattr(subclass, "__event_name__") and not subclass.__server_internal__:
+                event_subclasses.add(subclass)
+            event_subclasses.update(subclass.get_events())
+
+        return event_subclasses
+
+
+TEvent = TypeVar("TEvent", bound=EventBase, contravariant=True)
+
+FastAPIEvent: TypeAlias = tuple[str, TEvent]
+"""
+A tuple representing a `fastapi-events` event, with the event name and payload.
+Provide a generic type to `TEvent` to specify the payload type.
+"""
+
+
+class FastAPIEventFunc(Protocol, Generic[TEvent]):
+    def __call__(self, event: FastAPIEvent[TEvent]) -> Optional[Coroutine[Any, Any, None]]: ...
+
+
+def register_events(events: set[type[TEvent]] | type[TEvent], func: FastAPIEventFunc[TEvent]) -> None:
+    """Register a function to handle specific events.
+
+    :param events: An event or set of events to handle
+    :param func: The function to handle the events
+    """
+    events = events if isinstance(events, set) else {events}
+    for event in events:
+        assert hasattr(event, "__event_name__")
+        local_handler.register(event_name=event.__event_name__, _func=func)  # pyright: ignore [reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
+
+
+class QueueEventBase(EventBase):
+    """Base class for queue events"""
+
+    queue_id: str = Field(description="The ID of the queue")
+
+
+class QueueItemEventBase(QueueEventBase):
+    """Base class for queue item events"""
+
+    item_id: int = Field(description="The ID of the queue item")
+    batch_id: str = Field(description="The ID of the queue batch")
+    origin: str | None = Field(default=None, description="The origin of the queue item")
+    destination: str | None = Field(default=None, description="The destination of the queue item")
+    user_id: str = Field(default="system", description="The ID of the user who created the queue item")
+
+
+class InvocationEventBase(QueueItemEventBase):
+    """Base class for invocation events"""
+
+    session_id: str = Field(description="The ID of the session (aka graph execution state)")
+    queue_id: str = Field(description="The ID of the queue")
+    session_id: str = Field(description="The ID of the session (aka graph execution state)")
+    invocation: AnyInvocation = Field(description="The ID of the invocation")
+    invocation_source_id: str = Field(description="The ID of the prepared invocation's source node")
+    parent_item_id: int | None = Field(
+        default=None, description="The parent queue item id when this item is a called-workflow child"
+    )
+    root_item_id: int | None = Field(
+        default=None, description="The root queue item id for this called-workflow chain, if any"
+    )
+    workflow_call_parent_source_id: str | None = Field(
+        default=None,
+        description="The visible parent Call Saved Workflow source node for a called-workflow child event",
+    )
+
+
+def _get_workflow_call_parent_source_id(queue_item: SessionQueueItem) -> str | None:
+    """Return the root visible call node for a nested workflow-call event."""
+    if queue_item.session.workflow_call_stack:
+        return queue_item.session.workflow_call_stack[0].source_call_node_id
+    return None
+
+
+@payload_schema.register
+class InvocationStartedEvent(InvocationEventBase):
+    """Event model for invocation_started"""
+
+    __event_name__ = "invocation_started"
+
+    @classmethod
+    def build(cls, queue_item: SessionQueueItem, invocation: AnyInvocation) -> "InvocationStartedEvent":
+        return cls(
+            queue_id=queue_item.queue_id,
+            item_id=queue_item.item_id,
+            batch_id=queue_item.batch_id,
+            origin=queue_item.origin,
+            destination=queue_item.destination,
+            user_id=queue_item.user_id,
+            parent_item_id=queue_item.parent_item_id,
+            root_item_id=queue_item.root_item_id,
+            session_id=queue_item.session_id,
+            invocation=invocation,
+            invocation_source_id=queue_item.session.prepared_source_mapping[invocation.id],
+            workflow_call_parent_source_id=_get_workflow_call_parent_source_id(queue_item),
+        )
+
+
+@payload_schema.register
+class InvocationProgressEvent(InvocationEventBase):
+    """Event model for invocation_progress"""
+
+    __event_name__ = "invocation_progress"
+
+    message: str = Field(description="A message to display")
+    percentage: float | None = Field(
+        default=None, ge=0, le=1, description="The percentage of the progress (omit to indicate indeterminate progress)"
+    )
+    image: ProgressImage | None = Field(
+        default=None, description="An image representing the current state of the progress"
+    )
+    device: str | None = Field(
+        default=None,
+        description="The device processing this session, e.g. 'cuda:1' (set only when running on a GPU)",
+    )
+    revision: int | None = Field(
+        default=None,
+        description=(
+            "Monotonic per queue item and session, set on image-bearing frames. A frame at or below a "
+            "revision already shown is stale: the same frame may reach a client twice (live stream and "
+            "reconnect replay) and must never move the preview backwards."
+        ),
+    )
+
+    @classmethod
+    def build(
+        cls,
+        queue_item: SessionQueueItem,
+        invocation: AnyInvocation,
+        message: str,
+        percentage: float | None = None,
+        image: ProgressImage | None = None,
+        revision: int | None = None,
+    ) -> "InvocationProgressEvent":
+        # Report the GPU executing the session. Prefer the queue item's persisted device: the
+        # thread-local session device is temporarily re-pinned to a borrowed idle GPU during
+        # offloaded encoder nodes, and using it here would make the UI's device badge jump to the
+        # borrowed GPU and back within a single queue item.
+        device: str | None = (
+            queue_item.device if queue_item.device and queue_item.device.startswith(("cuda", "xpu")) else None
+        )
+        if device is None:
+            # Legacy single-device mode tags queue items with device=None; fall back to the worker
+            # thread's pinned device (set via TorchDevice.set_session_device()).
+            from invokeai.backend.util.devices import TorchDevice
+
+            session_device = TorchDevice.get_session_device()
+            device = (
+                str(session_device) if session_device is not None and session_device.type in ("cuda", "xpu") else None
+            )
+
+        return cls(
+            queue_id=queue_item.queue_id,
+            item_id=queue_item.item_id,
+            batch_id=queue_item.batch_id,
+            origin=queue_item.origin,
+            destination=queue_item.destination,
+            user_id=queue_item.user_id,
+            parent_item_id=queue_item.parent_item_id,
+            root_item_id=queue_item.root_item_id,
+            session_id=queue_item.session_id,
+            invocation=invocation,
+            invocation_source_id=queue_item.session.prepared_source_mapping[invocation.id],
+            workflow_call_parent_source_id=_get_workflow_call_parent_source_id(queue_item),
+            percentage=percentage,
+            image=image,
+            message=message,
+            device=device,
+            revision=revision,
+        )
+
+
+@payload_schema.register
+class InvocationCompleteEvent(InvocationEventBase):
+    """Event model for invocation_complete"""
+
+    __event_name__ = "invocation_complete"
+
+    result: AnyInvocationOutput = Field(description="The result of the invocation")
+
+    @classmethod
+    def build(
+        cls, queue_item: SessionQueueItem, invocation: AnyInvocation, result: AnyInvocationOutput
+    ) -> "InvocationCompleteEvent":
+        return cls(
+            queue_id=queue_item.queue_id,
+            item_id=queue_item.item_id,
+            batch_id=queue_item.batch_id,
+            origin=queue_item.origin,
+            destination=queue_item.destination,
+            user_id=queue_item.user_id,
+            parent_item_id=queue_item.parent_item_id,
+            root_item_id=queue_item.root_item_id,
+            session_id=queue_item.session_id,
+            invocation=invocation,
+            invocation_source_id=queue_item.session.prepared_source_mapping[invocation.id],
+            workflow_call_parent_source_id=_get_workflow_call_parent_source_id(queue_item),
+            result=result,
+        )
+
+
+@payload_schema.register
+class InvocationErrorEvent(InvocationEventBase):
+    """Event model for invocation_error"""
+
+    __event_name__ = "invocation_error"
+
+    error_type: str = Field(description="The error type")
+    error_message: str = Field(description="The error message")
+    error_traceback: str = Field(description="The error traceback")
+
+    @classmethod
+    def build(
+        cls,
+        queue_item: SessionQueueItem,
+        invocation: AnyInvocation,
+        error_type: str,
+        error_message: str,
+        error_traceback: str,
+    ) -> "InvocationErrorEvent":
+        return cls(
+            queue_id=queue_item.queue_id,
+            item_id=queue_item.item_id,
+            batch_id=queue_item.batch_id,
+            origin=queue_item.origin,
+            destination=queue_item.destination,
+            user_id=queue_item.user_id,
+            parent_item_id=queue_item.parent_item_id,
+            root_item_id=queue_item.root_item_id,
+            session_id=queue_item.session_id,
+            invocation=invocation,
+            invocation_source_id=queue_item.session.prepared_source_mapping[invocation.id],
+            workflow_call_parent_source_id=_get_workflow_call_parent_source_id(queue_item),
+            error_type=error_type,
+            error_message=error_message,
+            error_traceback=error_traceback,
+        )
+
+
+@payload_schema.register
+class QueueItemStatusChangedEvent(QueueItemEventBase):
+    """Event model for queue_item_status_changed"""
+
+    __event_name__ = "queue_item_status_changed"
+
+    status: QUEUE_ITEM_STATUS = Field(description="The new status of the queue item")
+    status_sequence: int | None = Field(
+        default=None,
+        description="A monotonically increasing version for this queue item's visible status lifecycle",
+    )
+    error_type: Optional[str] = Field(default=None, description="The error type, if any")
+    error_message: Optional[str] = Field(default=None, description="The error message, if any")
+    error_traceback: Optional[str] = Field(default=None, description="The error traceback, if any")
+    created_at: str = Field(description="The timestamp when the queue item was created")
+    updated_at: str = Field(description="The timestamp when the queue item was last updated")
+    started_at: Optional[str] = Field(default=None, description="The timestamp when the queue item was started")
+    completed_at: Optional[str] = Field(default=None, description="The timestamp when the queue item was completed")
+    batch_status: BatchStatus = Field(description="The status of the batch")
+    queue_status: SessionQueueStatus = Field(description="The status of the queue")
+    session_id: str = Field(description="The ID of the session (aka graph execution state)")
+
+    @classmethod
+    def build(
+        cls, queue_item: SessionQueueItem, batch_status: BatchStatus, queue_status: SessionQueueStatus
+    ) -> "QueueItemStatusChangedEvent":
+        return cls(
+            queue_id=queue_item.queue_id,
+            item_id=queue_item.item_id,
+            batch_id=queue_item.batch_id,
+            origin=queue_item.origin,
+            destination=queue_item.destination,
+            user_id=queue_item.user_id,
+            session_id=queue_item.session_id,
+            status=queue_item.status,
+            status_sequence=queue_item.status_sequence,
+            error_type=queue_item.error_type,
+            error_message=queue_item.error_message,
+            error_traceback=queue_item.error_traceback,
+            created_at=str(queue_item.created_at),
+            updated_at=str(queue_item.updated_at),
+            started_at=str(queue_item.started_at) if queue_item.started_at else None,
+            completed_at=str(queue_item.completed_at) if queue_item.completed_at else None,
+            batch_status=batch_status,
+            queue_status=queue_status,
+        )
+
+
+@payload_schema.register
+class BatchEnqueuedEvent(QueueEventBase):
+    """Event model for batch_enqueued"""
+
+    __event_name__ = "batch_enqueued"
+
+    batch_id: str = Field(description="The ID of the batch")
+    enqueued: int = Field(description="The number of invocations enqueued")
+    requested: int = Field(
+        description="The number of invocations initially requested to be enqueued (may be less than enqueued if queue was full)"
+    )
+    priority: int = Field(description="The priority of the batch")
+    origin: str | None = Field(default=None, description="The origin of the batch")
+    user_id: str = Field(default="system", description="The ID of the user who enqueued the batch")
+
+    @classmethod
+    def build(cls, enqueue_result: EnqueueBatchResult, user_id: str = "system") -> "BatchEnqueuedEvent":
+        return cls(
+            queue_id=enqueue_result.queue_id,
+            batch_id=enqueue_result.batch.batch_id,
+            origin=enqueue_result.batch.origin,
+            enqueued=enqueue_result.enqueued,
+            requested=enqueue_result.requested,
+            priority=enqueue_result.priority,
+            user_id=user_id,
+        )
+
+
+@payload_schema.register
+class QueueItemsRetriedEvent(QueueEventBase):
+    """Event model for queue_items_retried"""
+
+    __event_name__ = "queue_items_retried"
+
+    retried_item_ids: list[int] = Field(description="The IDs of the queue items that were retried")
+    user_ids: list[str] = Field(description="The IDs of the users who own the retried root queue items")
+    retried_item_ids_by_user: dict[str, list[int]] = Field(
+        description="The retried root queue item IDs keyed by owner user ID."
+    )
+    retried_items: list[RetriedQueueItem] = Field(
+        default_factory=list, description="Each retried root queue item with the queue item that re-runs it"
+    )
+
+    @classmethod
+    def build(
+        cls, retry_result: RetryItemsResult, user_ids: list[str], retried_item_ids_by_user: dict[str, list[int]]
+    ) -> "QueueItemsRetriedEvent":
+        return cls(
+            queue_id=retry_result.queue_id,
+            retried_item_ids=retry_result.retried_item_ids,
+            user_ids=user_ids,
+            retried_item_ids_by_user=retried_item_ids_by_user,
+            retried_items=retry_result.retried_items,
+        )
+
+
+@payload_schema.register
+class QueueItemsCanceledEvent(QueueEventBase):
+    """Event model for queue_items_canceled. Emitted when queue items are canceled or deleted in
+    bulk (e.g. cancel/delete-all-except-current) without per-item status change events."""
+
+    __event_name__ = "queue_items_canceled"
+
+    canceled_item_ids: list[int] = Field(description="The IDs of the queue items that were canceled or deleted")
+    user_ids: list[str] = Field(description="The IDs of the users who own the canceled queue items")
+    canceled_item_ids_by_user: dict[str, list[int]] = Field(
+        description="The canceled queue item IDs keyed by owner user ID."
+    )
+
+    @classmethod
+    def build(cls, queue_id: str, canceled_item_ids_by_user: dict[str, list[int]]) -> "QueueItemsCanceledEvent":
+        return cls(
+            queue_id=queue_id,
+            canceled_item_ids=[item_id for item_ids in canceled_item_ids_by_user.values() for item_id in item_ids],
+            user_ids=list(canceled_item_ids_by_user.keys()),
+            canceled_item_ids_by_user=canceled_item_ids_by_user,
+        )
+
+
+@payload_schema.register
+class QueueClearedEvent(QueueEventBase):
+    """Event model for queue_cleared"""
+
+    __event_name__ = "queue_cleared"
+
+    user_id: str | None = Field(
+        default=None,
+        description="The ID of the user whose queue items were cleared, or None if all users' items were cleared",
+    )
+
+    @classmethod
+    def build(cls, queue_id: str, user_id: str | None = None) -> "QueueClearedEvent":
+        return cls(queue_id=queue_id, user_id=user_id)
+
+
+class WorkflowEventBase(EventBase):
+    """Base class for workflow library CRUD events."""
+
+    workflow_id: str = Field(description="The ID of the workflow")
+    user_id: str = Field(description="The owner of the workflow")
+
+
+@payload_schema.register
+class WorkflowCreatedEvent(WorkflowEventBase):
+    """Event model for workflow_created"""
+
+    __event_name__ = "workflow_created"
+
+    is_public: bool = Field(description="Whether the workflow is shared with all users")
+
+    @classmethod
+    def build(cls, workflow_id: str, user_id: str, is_public: bool) -> "WorkflowCreatedEvent":
+        return cls(workflow_id=workflow_id, user_id=user_id, is_public=is_public)
+
+
+@payload_schema.register
+class WorkflowUpdatedEvent(WorkflowEventBase):
+    """Event model for workflow_updated"""
+
+    __event_name__ = "workflow_updated"
+
+    old_is_public: bool = Field(description="Whether the workflow was shared before the update")
+    new_is_public: bool = Field(description="Whether the workflow is shared after the update")
+
+    @classmethod
+    def build(cls, workflow_id: str, user_id: str, old_is_public: bool, new_is_public: bool) -> "WorkflowUpdatedEvent":
+        return cls(
+            workflow_id=workflow_id,
+            user_id=user_id,
+            old_is_public=old_is_public,
+            new_is_public=new_is_public,
+        )
+
+
+@payload_schema.register
+class WorkflowDeletedEvent(WorkflowEventBase):
+    """Event model for workflow_deleted"""
+
+    __event_name__ = "workflow_deleted"
+
+    is_public: bool = Field(description="Whether the workflow was shared when it was deleted")
+
+    @classmethod
+    def build(cls, workflow_id: str, user_id: str, is_public: bool) -> "WorkflowDeletedEvent":
+        return cls(workflow_id=workflow_id, user_id=user_id, is_public=is_public)
+
+
+@payload_schema.register
+class WorkflowAccessRevokedEvent(WorkflowEventBase):
+    """Event model for workflow_access_revoked."""
+
+    __event_name__ = "workflow_access_revoked"
+
+    @classmethod
+    def build(cls, workflow_id: str, user_id: str) -> "WorkflowAccessRevokedEvent":
+        return cls(workflow_id=workflow_id, user_id=user_id)
+
+
+class DownloadEventBase(EventBase):
+    """Base class for events associated with a download"""
+
+    source: str = Field(description="The source of the download")
+
+
+@payload_schema.register
+class DownloadStartedEvent(DownloadEventBase):
+    """Event model for download_started"""
+
+    __event_name__ = "download_started"
+
+    download_path: str = Field(description="The local path where the download is saved")
+
+    @classmethod
+    def build(cls, job: "DownloadJob") -> "DownloadStartedEvent":
+        assert job.download_path
+        return cls(source=str(job.source), download_path=job.download_path.as_posix())
+
+
+@payload_schema.register
+class DownloadProgressEvent(DownloadEventBase):
+    """Event model for download_progress"""
+
+    __event_name__ = "download_progress"
+
+    download_path: str = Field(description="The local path where the download is saved")
+    current_bytes: int = Field(description="The number of bytes downloaded so far")
+    total_bytes: int = Field(description="The total number of bytes to be downloaded")
+
+    @classmethod
+    def build(cls, job: "DownloadJob") -> "DownloadProgressEvent":
+        assert job.download_path
+        return cls(
+            source=str(job.source),
+            download_path=job.download_path.as_posix(),
+            current_bytes=job.bytes,
+            total_bytes=job.total_bytes,
+        )
+
+
+@payload_schema.register
+class DownloadCompleteEvent(DownloadEventBase):
+    """Event model for download_complete"""
+
+    __event_name__ = "download_complete"
+
+    download_path: str = Field(description="The local path where the download is saved")
+    total_bytes: int = Field(description="The total number of bytes downloaded")
+
+    @classmethod
+    def build(cls, job: "DownloadJob") -> "DownloadCompleteEvent":
+        assert job.download_path
+        return cls(source=str(job.source), download_path=job.download_path.as_posix(), total_bytes=job.total_bytes)
+
+
+@payload_schema.register
+class DownloadCancelledEvent(DownloadEventBase):
+    """Event model for download_cancelled"""
+
+    __event_name__ = "download_cancelled"
+
+    @classmethod
+    def build(cls, job: "DownloadJob") -> "DownloadCancelledEvent":
+        return cls(source=str(job.source))
+
+
+@payload_schema.register
+class DownloadPausedEvent(DownloadEventBase):
+    """Event model for download_paused"""
+
+    __event_name__ = "download_paused"
+
+    @classmethod
+    def build(cls, job: "DownloadJob") -> "DownloadPausedEvent":
+        return cls(source=str(job.source))
+
+
+@payload_schema.register
+class DownloadErrorEvent(DownloadEventBase):
+    """Event model for download_error"""
+
+    __event_name__ = "download_error"
+
+    error_type: str = Field(description="The type of error")
+    error: str = Field(description="The error message")
+
+    @classmethod
+    def build(cls, job: "DownloadJob") -> "DownloadErrorEvent":
+        assert job.error_type
+        assert job.error
+        return cls(source=str(job.source), error_type=job.error_type, error=job.error)
+
+
+class ModelEventBase(EventBase):
+    """Base class for events associated with a model"""
+
+
+@payload_schema.register
+class ModelLoadStartedEvent(ModelEventBase):
+    """Event model for model_load_started"""
+
+    __event_name__ = "model_load_started"
+
+    config: AnyModelConfig = Field(description="The model's config")
+    submodel_type: Optional[SubModelType] = Field(default=None, description="The submodel type, if any")
+    user_id: str = Field(default="system", description="The ID of the user whose action triggered the load")
+
+    @classmethod
+    def build(
+        cls, config: AnyModelConfig, submodel_type: Optional[SubModelType] = None, user_id: str = "system"
+    ) -> "ModelLoadStartedEvent":
+        return cls(config=config, submodel_type=submodel_type, user_id=user_id)
+
+
+@payload_schema.register
+class ModelLoadCompleteEvent(ModelEventBase):
+    """Event model for model_load_complete"""
+
+    __event_name__ = "model_load_complete"
+
+    config: AnyModelConfig = Field(description="The model's config")
+    submodel_type: Optional[SubModelType] = Field(default=None, description="The submodel type, if any")
+    user_id: str = Field(default="system", description="The ID of the user whose action triggered the load")
+
+    @classmethod
+    def build(
+        cls, config: AnyModelConfig, submodel_type: Optional[SubModelType] = None, user_id: str = "system"
+    ) -> "ModelLoadCompleteEvent":
+        return cls(config=config, submodel_type=submodel_type, user_id=user_id)
+
+
+@payload_schema.register
+class ModelInstallDownloadStartedEvent(ModelEventBase):
+    """Event model for model_install_download_started"""
+
+    __event_name__ = "model_install_download_started"
+
+    id: int = Field(description="The ID of the install job")
+    source: ModelSource = Field(description="Source of the model; local path, repo_id or url")
+    local_path: str = Field(description="Where model is downloading to")
+    bytes: int = Field(description="Number of bytes downloaded so far")
+    total_bytes: int = Field(description="Total size of download, including all files")
+    parts: list[dict[str, int | str]] = Field(
+        description="Progress of downloading URLs that comprise the model, if any"
+    )
+
+    @classmethod
+    def build(cls, job: "ModelInstallJob") -> "ModelInstallDownloadStartedEvent":
+        parts: list[dict[str, str | int]] = [
+            {
+                "url": str(x.source),
+                "local_path": str(x.download_path),
+                "bytes": x.bytes,
+                "total_bytes": x.total_bytes,
+            }
+            for x in job.download_parts
+        ]
+        return cls(
+            id=job.id,
+            source=job.source,
+            local_path=job.local_path.as_posix(),
+            parts=parts,
+            bytes=job.bytes,
+            total_bytes=job.total_bytes,
+        )
+
+
+@payload_schema.register
+class ModelInstallDownloadProgressEvent(ModelEventBase):
+    """Event model for model_install_download_progress"""
+
+    __event_name__ = "model_install_download_progress"
+
+    id: int = Field(description="The ID of the install job")
+    source: ModelSource = Field(description="Source of the model; local path, repo_id or url")
+    local_path: str = Field(description="Where model is downloading to")
+    bytes: int = Field(description="Number of bytes downloaded so far")
+    total_bytes: int = Field(description="Total size of download, including all files")
+    parts: list[dict[str, int | str]] = Field(
+        description="Progress of downloading URLs that comprise the model, if any"
+    )
+
+    @classmethod
+    def build(cls, job: "ModelInstallJob") -> "ModelInstallDownloadProgressEvent":
+        parts: list[dict[str, str | int]] = [
+            {
+                "url": str(x.source),
+                "local_path": str(x.download_path),
+                "bytes": x.bytes,
+                "total_bytes": x.total_bytes,
+            }
+            for x in job.download_parts
+        ]
+        return cls(
+            id=job.id,
+            source=job.source,
+            local_path=job.local_path.as_posix(),
+            parts=parts,
+            bytes=job.bytes,
+            total_bytes=job.total_bytes,
+        )
+
+
+@payload_schema.register
+class ModelInstallDownloadsCompleteEvent(ModelEventBase):
+    """Emitted once when an install job becomes active."""
+
+    __event_name__ = "model_install_downloads_complete"
+
+    id: int = Field(description="The ID of the install job")
+    source: ModelSource = Field(description="Source of the model; local path, repo_id or url")
+
+    @classmethod
+    def build(cls, job: "ModelInstallJob") -> "ModelInstallDownloadsCompleteEvent":
+        return cls(id=job.id, source=job.source)
+
+
+@payload_schema.register
+class ModelInstallStartedEvent(ModelEventBase):
+    """Event model for model_install_started"""
+
+    __event_name__ = "model_install_started"
+
+    id: int = Field(description="The ID of the install job")
+    source: ModelSource = Field(description="Source of the model; local path, repo_id or url")
+
+    @classmethod
+    def build(cls, job: "ModelInstallJob") -> "ModelInstallStartedEvent":
+        return cls(id=job.id, source=job.source)
+
+
+@payload_schema.register
+class ModelInstallCompleteEvent(ModelEventBase):
+    """Event model for model_install_complete"""
+
+    __event_name__ = "model_install_complete"
+
+    id: int = Field(description="The ID of the install job")
+    source: ModelSource = Field(description="Source of the model; local path, repo_id or url")
+    key: str = Field(description="Model config record key")
+    total_bytes: Optional[int] = Field(description="Size of the model (may be None for installation of a local path)")
+    config: AnyModelConfig = Field(description="The installed model's config")
+
+    @classmethod
+    def build(cls, job: "ModelInstallJob") -> "ModelInstallCompleteEvent":
+        assert job.config_out is not None
+        return cls(
+            id=job.id,
+            source=job.source,
+            key=(job.config_out.key),
+            total_bytes=job.total_bytes,
+            config=job.config_out,
+        )
+
+
+@payload_schema.register
+class ModelInstallCancelledEvent(ModelEventBase):
+    """Event model for model_install_cancelled"""
+
+    __event_name__ = "model_install_cancelled"
+
+    id: int = Field(description="The ID of the install job")
+    source: ModelSource = Field(description="Source of the model; local path, repo_id or url")
+
+    @classmethod
+    def build(cls, job: "ModelInstallJob") -> "ModelInstallCancelledEvent":
+        return cls(id=job.id, source=job.source)
+
+
+@payload_schema.register
+class ModelInstallErrorEvent(ModelEventBase):
+    """Event model for model_install_error"""
+
+    __event_name__ = "model_install_error"
+
+    id: int = Field(description="The ID of the install job")
+    source: ModelSource = Field(description="Source of the model; local path, repo_id or url")
+    error_type: str = Field(description="The name of the exception")
+    error: str = Field(description="A text description of the exception")
+
+    @classmethod
+    def build(cls, job: "ModelInstallJob") -> "ModelInstallErrorEvent":
+        assert job.error_type is not None
+        assert job.error is not None
+        return cls(id=job.id, source=job.source, error_type=job.error_type, error=job.error)
+
+
+class BulkDownloadEventBase(EventBase):
+    """Base class for events associated with a bulk image download"""
+
+    bulk_download_id: str = Field(description="The ID of the bulk image download")
+    bulk_download_item_id: str = Field(description="The ID of the bulk image download item")
+    bulk_download_item_name: str = Field(description="The name of the bulk image download item")
+    user_id: str = Field(default="system", description="The ID of the user who initiated the download")
+
+
+@payload_schema.register
+class BulkDownloadStartedEvent(BulkDownloadEventBase):
+    """Event model for bulk_download_started"""
+
+    __event_name__ = "bulk_download_started"
+
+    @classmethod
+    def build(
+        cls,
+        bulk_download_id: str,
+        bulk_download_item_id: str,
+        bulk_download_item_name: str,
+        user_id: str = "system",
+    ) -> "BulkDownloadStartedEvent":
+        return cls(
+            bulk_download_id=bulk_download_id,
+            bulk_download_item_id=bulk_download_item_id,
+            bulk_download_item_name=bulk_download_item_name,
+            user_id=user_id,
+        )
+
+
+@payload_schema.register
+class BulkDownloadCompleteEvent(BulkDownloadEventBase):
+    """Event model for bulk_download_complete"""
+
+    __event_name__ = "bulk_download_complete"
+
+    @classmethod
+    def build(
+        cls,
+        bulk_download_id: str,
+        bulk_download_item_id: str,
+        bulk_download_item_name: str,
+        user_id: str = "system",
+    ) -> "BulkDownloadCompleteEvent":
+        return cls(
+            bulk_download_id=bulk_download_id,
+            bulk_download_item_id=bulk_download_item_id,
+            bulk_download_item_name=bulk_download_item_name,
+            user_id=user_id,
+        )
+
+
+@payload_schema.register
+class BulkDownloadErrorEvent(BulkDownloadEventBase):
+    """Event model for bulk_download_error"""
+
+    __event_name__ = "bulk_download_error"
+
+    error: str = Field(description="The error message")
+
+    @classmethod
+    def build(
+        cls,
+        bulk_download_id: str,
+        bulk_download_item_id: str,
+        bulk_download_item_name: str,
+        error: str,
+        user_id: str = "system",
+    ) -> "BulkDownloadErrorEvent":
+        return cls(
+            bulk_download_id=bulk_download_id,
+            bulk_download_item_id=bulk_download_item_id,
+            bulk_download_item_name=bulk_download_item_name,
+            error=error,
+            user_id=user_id,
+        )
+
+
+class LLMTaskEventBase(EventBase):
+    """Base class for LLM utility task events (expand-prompt, image-to-prompt).
+
+    These events are correlated to a specific HTTP request via a client-supplied
+    task_id and routed privately to the originating user so partial prompt content
+    is not broadcast.
+    """
+
+    task_id: str = Field(description="Client-supplied task ID correlating events to a single request")
+    user_id: str = Field(default="system", description="ID of the user who initiated the task")
+
+
+@payload_schema.register
+class LLMTaskProgressEvent(LLMTaskEventBase):
+    """Event model for llm_task_progress"""
+
+    __event_name__ = "llm_task_progress"
+
+    phase: Literal["loading_model", "generating"] = Field(description="Which phase of the task is in progress")
+    message: str = Field(description="A short message describing the current phase")
+    percentage: float | None = Field(
+        default=None, ge=0, le=1, description="Progress fraction in [0, 1]; omit for indeterminate progress"
+    )
+    current_tokens: int | None = Field(default=None, description="Number of tokens generated so far (generating phase)")
+    total_tokens: int | None = Field(
+        default=None, description="Max tokens the request will generate (generating phase)"
+    )
+
+
+@payload_schema.register
+class LLMTaskCompleteEvent(LLMTaskEventBase):
+    """Event model for llm_task_complete"""
+
+    __event_name__ = "llm_task_complete"
+
+
+@payload_schema.register
+class LLMTaskErrorEvent(LLMTaskEventBase):
+    """Event model for llm_task_error"""
+
+    __event_name__ = "llm_task_error"
+
+    error: str = Field(description="The error message")
+
+
+@payload_schema.register
+class RecallParametersUpdatedEvent(QueueEventBase):
+    """Event model for recall_parameters_updated"""
+
+    __event_name__ = "recall_parameters_updated"
+
+    user_id: str = Field(description="The ID of the user whose recall parameters were updated")
+    parameters: dict[str, Any] = Field(description="The recall parameters that were updated")
+
+    @classmethod
+    def build(cls, queue_id: str, user_id: str, parameters: dict[str, Any]) -> "RecallParametersUpdatedEvent":
+        return cls(queue_id=queue_id, user_id=user_id, parameters=parameters)
+
+
+VideoRecallAction: TypeAlias = Literal["parameters", "initial_video", "reference_video", "conditioning_video", "image"]
+VideoRecallConditioningRole: TypeAlias = Literal["audio", "video"]
+VideoRecallMode: TypeAlias = Literal["recall", "remix"]
+
+
+class VideoRecallVideo(BaseModel):
+    """The gallery video a video recall places into the Video panel."""
+
+    video_name: str = Field(description="The name of the gallery video")
+    width: int = Field(description="The video's width in pixels")
+    height: int = Field(description="The video's height in pixels")
+    duration: float = Field(description="The video's duration in seconds")
+    fps: Optional[float] = Field(default=None, description="The video's frame rate, when known")
+    media_origin: Optional[str] = Field(
+        default=None, description="How the video entered the gallery, e.g. `audio_upload` for wrapped audio"
+    )
+
+
+class VideoRecallImage(BaseModel):
+    """The gallery image a video recall places into the Video panel."""
+
+    image_name: str = Field(description="The name of the gallery image")
+    width: int = Field(description="The image's width in pixels")
+    height: int = Field(description="The image's height in pixels")
+
+
+@payload_schema.register
+class VideoRecallRequestedEvent(QueueEventBase):
+    """Event model for video_recall_requested"""
+
+    __event_name__ = "video_recall_requested"
+
+    user_id: str = Field(description="The ID of the user whose Video panel the recall targets")
+    action: VideoRecallAction = Field(description="What the frontend should do with the payload")
+    mode: Optional[VideoRecallMode] = Field(
+        default=None, description="For `parameters`: `remix` applies everything except the seed"
+    )
+    strict: bool = Field(
+        default=False,
+        description="For `parameters`: treat the payload as a whole generation record, clearing omitted LoRAs and media",
+    )
+    parameters: Optional[dict[str, Any]] = Field(
+        default=None, description="For `parameters`: recall fields, keyed like the video metadata record"
+    )
+    video: Optional[VideoRecallVideo] = Field(
+        default=None, description="For `initial_video`, `reference_video` and `conditioning_video`: the video to place"
+    )
+    conditioning_role: Optional[VideoRecallConditioningRole] = Field(
+        default=None,
+        description="For `conditioning_video`: which stream of the video is the condition; the other is generated",
+    )
+    image: Optional[VideoRecallImage] = Field(default=None, description="For `image`: the image to place")
+    append: bool = Field(
+        default=False,
+        description=(
+            "For `image`: add the image after the panel's own instead of replacing them -- to the reference images "
+            "of a model that takes references, otherwise to the free frame slot"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _role_iff_conditioning_video(self) -> "VideoRecallRequestedEvent":
+        if (self.action == "conditioning_video") != (self.conditioning_role is not None):
+            raise ValueError("conditioning_role is given with, and only with, a conditioning_video action")
+        if (self.action == "image") != (self.image is not None):
+            raise ValueError("image is given with, and only with, an image action")
+        if self.append and self.action != "image":
+            raise ValueError("append is given only with an image action")
+        return self
+
+    @classmethod
+    def build(
+        cls,
+        queue_id: str,
+        user_id: str,
+        action: VideoRecallAction,
+        mode: Optional[VideoRecallMode] = None,
+        strict: bool = False,
+        parameters: Optional[dict[str, Any]] = None,
+        video: Optional[VideoRecallVideo] = None,
+        conditioning_role: Optional[VideoRecallConditioningRole] = None,
+        image: Optional[VideoRecallImage] = None,
+        append: bool = False,
+    ) -> "VideoRecallRequestedEvent":
+        return cls(
+            queue_id=queue_id,
+            user_id=user_id,
+            action=action,
+            mode=mode,
+            strict=strict,
+            parameters=parameters,
+            video=video,
+            conditioning_role=conditioning_role,
+            image=image,
+            append=append,
+        )
+
+
+class ImageIndexEventBase(EventBase):
+    """Base class for image index events"""
+
+
+@payload_schema.register
+class ImageIndexStatusEvent(ImageIndexEventBase):
+    """Event model for image_index_status"""
+
+    __event_name__ = "image_index_status"
+
+    total: int = Field(description="Number of gallery images eligible for embedding")
+    embedded: int = Field(description="Number of eligible images that have an embedding")
+    pending: int = Field(description="Number of eligible images awaiting embedding")
+    failed: int = Field(
+        default=0,
+        description=(
+            "Eligible images that repeatedly failed to embed and were given up on. Excluded from "
+            "`pending`, so `total != embedded` with `pending == 0` means this many were skipped."
+        ),
+    )
+
+    @classmethod
+    def build(cls, total: int, embedded: int, pending: int, failed: int = 0) -> "ImageIndexStatusEvent":
+        return cls(total=total, embedded=embedded, pending=pending, failed=failed)
+
+
+@payload_schema.register
+class ImageIndexUpdatedEvent(ImageIndexEventBase):
+    """Event model for image_index_updated.
+
+    A counts-free poke to one user whose images were just (re)embedded, so
+    their client can refresh views built on the index. Kept separate from
+    ImageIndexStatusEvent because the counts aggregate every user's images
+    and are therefore admin-only, while this event is safe to route to the
+    owning user's room.
+    """
+
+    __event_name__ = "image_index_updated"
+
+    user_id: str = Field(description="The user whose images were embedded")
+
+    @classmethod
+    def build(cls, user_id: str) -> "ImageIndexUpdatedEvent":
+        return cls(user_id=user_id)
+
+
+@payload_schema.register
+class ImageMapProjectionReadyEvent(ImageIndexEventBase):
+    """Event model for image_map_projection_ready"""
+
+    __event_name__ = "image_map_projection_ready"
+
+    user_id: str = Field(description="The user whose image map projection was recomputed")
+    point_count: int = Field(description="Number of points in the recomputed projection")
+
+    @classmethod
+    def build(cls, user_id: str, point_count: int) -> "ImageMapProjectionReadyEvent":
+        return cls(user_id=user_id, point_count=point_count)
+
+
+class MediaUploadedEventBase(EventBase):
+    """Base class for media upload events.
+
+    Tells clients that gallery content appeared through the upload API, which no queue event
+    announces. Emitted for gallery-visible uploads only: intermediates and canvas-owned OTHER
+    category images never show in the gallery, and canvas editing uploads both constantly.
+    """
+
+    user_id: str = Field(description="The user who uploaded the media")
+    board_id: Optional[str] = Field(default=None, description="The board the media was added to, if any")
+
+
+@payload_schema.register
+class ImageUploadedEvent(MediaUploadedEventBase):
+    """Event model for image_uploaded"""
+
+    __event_name__ = "image_uploaded"
+
+    image_name: str = Field(description="The name of the uploaded image")
+    image_category: ImageCategory = Field(description="The category of the uploaded image")
+
+    @classmethod
+    def build(
+        cls,
+        image_name: str,
+        image_category: ImageCategory,
+        user_id: str,
+        board_id: Optional[str],
+    ) -> "ImageUploadedEvent":
+        return cls(
+            image_name=image_name,
+            image_category=image_category,
+            user_id=user_id,
+            board_id=board_id,
+        )
+
+
+@payload_schema.register
+class VideoUploadedEvent(MediaUploadedEventBase):
+    """Event model for video_uploaded"""
+
+    __event_name__ = "video_uploaded"
+
+    video_name: str = Field(description="The name of the uploaded video")
+    video_category: ImageCategory = Field(description="The category of the uploaded video")
+
+    @classmethod
+    def build(
+        cls,
+        video_name: str,
+        video_category: ImageCategory,
+        user_id: str,
+        board_id: Optional[str],
+    ) -> "VideoUploadedEvent":
+        return cls(
+            video_name=video_name,
+            video_category=video_category,
+            user_id=user_id,
+            board_id=board_id,
+        )
+
+
+class IntermediatesEventBase(EventBase):
+    """Base class for intermediates cleanup events"""
+
+
+@payload_schema.register
+class IntermediatesOperationChangedEvent(IntermediatesEventBase):
+    """Event model for intermediates_operation_changed.
+
+    Routed to the confirming account's room and to admins: the operation's progress is that
+    account's business, and admins see every cleanup so open managers refresh their counts.
+    """
+
+    __event_name__ = "intermediates_operation_changed"
+
+    user_id: str = Field(description="The account that confirmed the operation")
+    operation: IntermediatesOperation = Field(description="The operation's current state")
+
+    @classmethod
+    def build(cls, operation: "IntermediatesOperation") -> "IntermediatesOperationChangedEvent":
+        return cls(user_id=operation.user_id, operation=operation)
+
+
+class UserAccessChangedEvent(EventBase):
+    """Event model for user_access_changed.
+
+    Emitted when a user's authorization state changes (role change, deactivation,
+    or deletion) so that live connections — e.g. open sockets — can be re-authorized
+    immediately instead of trusting connect-time claims until reconnect.
+
+    This event is server-internal: it is deliberately NOT registered with
+    `payload_schema`, is excluded from the generated API schema, and is never
+    emitted to clients.
+    """
+
+    __event_name__ = "user_access_changed"
+    __server_internal__ = True
+
+    user_id: str = Field(description="The ID of the affected user")
+    is_admin: bool = Field(description="Whether the user currently has admin privileges")
+    is_active: bool = Field(description="Whether the user account is currently active (False for deleted users)")
+    token_epoch: int = Field(
+        default=0,
+        description="The user's current token revocation epoch; sockets that authenticated under an older one are dropped",
+    )
+
+    @classmethod
+    def build(cls, user_id: str, is_admin: bool, is_active: bool, token_epoch: int = 0) -> "UserAccessChangedEvent":
+        return cls(user_id=user_id, is_admin=is_admin, is_active=is_active, token_epoch=token_epoch)

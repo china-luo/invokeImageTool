@@ -1,0 +1,95 @@
+# Runs python code quality checks.
+#
+# Checks for changes to python files before running the checks.
+# If always_run is true, always runs the checks.
+#
+# TODO: Add mypy or pyright to the checks.
+
+name: 'python checks'
+
+on:
+  push:
+    branches:
+      - 'main'
+  pull_request:
+    types:
+      - 'ready_for_review'
+      - 'opened'
+      - 'synchronize'
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      always_run:
+        description: 'Always run the checks'
+        required: true
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      always_run:
+        description: 'Always run the checks'
+        required: true
+        type: boolean
+        default: true
+
+# One run per pull request: a new push cancels the superseded run. The PR number is used rather
+# than the head branch, which two forks can share. Pushes to main and merge groups fall back to
+# the run id and never cancel each other. The group names the workflow literally
+# because `github.workflow` is the caller's name inside a reusable workflow, and release.yml calls
+# several of these at once.
+permissions:
+  contents: read
+
+concurrency:
+  group: python-checks-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  python-checks:
+    env:
+      # uv requires a venv by default - but for this, we can simply use the system python
+      UV_SYSTEM_PYTHON: 1
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5 # expected run time: <1 min
+    steps:
+      - name: checkout
+        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+
+      - name: check for changed python files
+        if: ${{ inputs.always_run != true }}
+        id: changed-files
+        # Pinned to the _hash_ for v45.0.9 to prevent supply-chain attacks.
+        # See:
+        # - CVE-2025-30066
+        # - https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-action-is-compromised
+        # - https://github.com/tj-actions/changed-files/issues/2463
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96
+        with:
+          files_yaml: |
+            python:
+              # ruff config and the classifier check both read pyproject.toml.
+              - 'pyproject.toml'
+              - '.github/workflows/python-checks.yml'
+              # ruff lints every tracked .py file from the repository root, wherever it lives.
+              - '**/*.py'
+
+      - name: setup uv
+        if: ${{ steps.changed-files.outputs.python_any_changed == 'true' || inputs.always_run == true }}
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: '0.11.28'  # When updating this, make sure the version in launcher's package.json gets updated too.
+          enable-cache: true
+
+      - name: check pypi classifiers
+        if: ${{ steps.changed-files.outputs.python_any_changed == 'true' || inputs.always_run == true }}
+        run: uv run --no-project scripts/check_classifiers.py ./pyproject.toml
+
+      - name: ruff check
+        if: ${{ steps.changed-files.outputs.python_any_changed == 'true' || inputs.always_run == true }}
+        run: uv tool run ruff@0.11.2 check --output-format=github .
+        shell: bash
+
+      - name: ruff format
+        if: ${{ steps.changed-files.outputs.python_any_changed == 'true' || inputs.always_run == true }}
+        run: uv tool run ruff@0.11.2 format --check .
+        shell: bash

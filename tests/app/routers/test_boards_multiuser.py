@@ -1,0 +1,1313 @@
+"""Tests for multiuser boards functionality."""
+
+import inspect
+from contextlib import nullcontext
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi import status
+from fastapi.testclient import TestClient
+
+from invokeai.app.api.dependencies import ApiDependencies
+from invokeai.app.api.routers.boards import delete_board
+from invokeai.app.api_app import app
+from invokeai.app.services.board_access.board_access_common import BoardViewer
+from invokeai.app.services.invoker import Invoker
+from invokeai.app.services.shared.database.database import Database
+from invokeai.app.services.users.users_common import UserCreateRequest
+from tests.fixtures.sqlite_database import sqlite_cursor
+
+
+class MockApiDependencies(ApiDependencies):
+    """Mock API dependencies for testing."""
+
+    invoker: Invoker
+
+    def __init__(self, invoker: Invoker) -> None:
+        self.invoker = invoker
+
+
+@pytest.fixture
+def setup_jwt_secret():
+    """Initialize JWT secret for token generation."""
+    from invokeai.app.services.auth.token_service import set_jwt_secret
+
+    # Use a test secret key
+    set_jwt_secret("test-secret-key-for-unit-tests-only-do-not-use-in-production")
+
+
+@pytest.fixture
+def client():
+    """Create a test client."""
+    return TestClient(app)
+
+
+def setup_test_user(
+    mock_invoker: Invoker,
+    email: str,
+    display_name: str,
+    password: str = "TestPass123",
+    is_admin: bool = False,
+) -> str:
+    """Helper to create a test user and return user_id."""
+    user_service = mock_invoker.services.users
+    user_data = UserCreateRequest(
+        email=email,
+        display_name=display_name,
+        password=password,
+        is_admin=is_admin,
+    )
+    user = user_service.create(user_data)
+    return user.user_id
+
+
+def get_user_token(client: TestClient, email: str, password: str = "TestPass123") -> str:
+    """Helper to login and get a user token."""
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"email": email, "password": password, "remember_me": False},
+    )
+    assert response.status_code == 200
+    return response.json()["token"]
+
+
+@pytest.fixture
+def enable_multiuser_for_tests(monkeypatch: Any, mock_invoker: Invoker):
+    """Enable multiuser mode and patch ApiDependencies for all relevant routers."""
+    mock_invoker.services.configuration.multiuser = True
+    # Provide a mock board_images service so delete/image_names endpoints don't 500
+    mock_board_images = MagicMock()
+    mock_board_images.get_all_board_image_names_for_board.return_value = []
+    mock_invoker.services.board_images = mock_board_images
+
+    # delete_board cascade-deletes videos on the board too — stub the video services
+    # so the route doesn't hit AttributeError on the None placeholders in mock_services.
+    mock_board_video_records = MagicMock()
+    mock_board_video_records.get_all_board_video_names_for_board.return_value = []
+    mock_board_video_records.get_counts_for_board.return_value = (0, 0)
+    mock_invoker.services.board_video_records = mock_board_video_records
+    # The board service also consults video_records for cover-image selection (most recent video).
+    mock_video_records = MagicMock()
+    mock_video_records.get_most_recent_video_for_board.return_value = None
+    mock_invoker.services.video_records = mock_video_records
+    mock_invoker.services.videos = MagicMock()
+    # ``delete_videos_by_names`` returns the authoritative ``deleted_videos`` list (only the
+    # videos whose file deletion actually succeeded). Default to an empty list so pydantic
+    # validation on ``DeleteBoardResult`` doesn't reject the MagicMock auto-return.
+    mock_invoker.services.videos.delete_videos_by_names.return_value = ([], [])
+    mock_invoker.services.videos.delete_videos_on_board.return_value = ([], [])
+    # The images service is a real ImageService instance in mock_services; the delete-board
+    # cascade calls ``delete_images_by_names`` on it, which fails without an initialized
+    # invoker. Stub it so the multiuser router tests can assert the cascade args.
+    mock_invoker.services.images = MagicMock()
+    mock_invoker.services.images.delete_images_by_names.return_value = ([], [])
+    mock_invoker.services.images.delete_images_on_board.return_value = ([], [])
+
+    mock_deps = MockApiDependencies(mock_invoker)
+    monkeypatch.setattr("invokeai.app.api.routers.auth.ApiDependencies", mock_deps)
+    monkeypatch.setattr("invokeai.app.api.auth_dependencies.ApiDependencies", mock_deps)
+    monkeypatch.setattr("invokeai.app.api.routers.boards.ApiDependencies", mock_deps)
+    monkeypatch.setattr("invokeai.app.api.routers._access.ApiDependencies", mock_deps)
+    yield
+
+
+@pytest.fixture
+def admin_token(setup_jwt_secret: None, enable_multiuser_for_tests: Any, mock_invoker: Invoker, client: TestClient):
+    """Create an admin user and return a login token."""
+    setup_test_user(mock_invoker, "admin@test.com", "Test Admin", is_admin=True)
+    return get_user_token(client, "admin@test.com")
+
+
+@pytest.fixture
+def user1_token(enable_multiuser_for_tests: Any, mock_invoker: Invoker, client: TestClient, admin_token: str):
+    """Create a regular user and return a login token."""
+    setup_test_user(mock_invoker, "user1@test.com", "User One", is_admin=False)
+    return get_user_token(client, "user1@test.com")
+
+
+@pytest.fixture
+def user2_token(enable_multiuser_for_tests: Any, mock_invoker: Invoker, client: TestClient, admin_token: str):
+    """Create a second regular user and return a login token."""
+    setup_test_user(mock_invoker, "user2@test.com", "User Two", is_admin=False)
+    return get_user_token(client, "user2@test.com")
+
+
+# ---------------------------------------------------------------------------
+# Basic auth requirement tests
+# ---------------------------------------------------------------------------
+
+
+def test_create_board_requires_auth(enable_multiuser_for_tests: Any, client: TestClient):
+    """Test that creating a board requires authentication."""
+    response = client.post("/api/v1/boards/?board_name=Test+Board")
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_list_boards_requires_auth(enable_multiuser_for_tests: Any, client: TestClient):
+    """Test that listing boards requires authentication."""
+    response = client.get("/api/v1/boards/?all=true")
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_get_board_requires_auth(enable_multiuser_for_tests: Any, client: TestClient):
+    """Test that getting a board requires authentication."""
+    response = client.get("/api/v1/boards/some-board-id")
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_update_board_requires_auth(enable_multiuser_for_tests: Any, client: TestClient):
+    """Test that updating a board requires authentication."""
+    response = client.patch("/api/v1/boards/some-board-id", json={"board_name": "New Name"})
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_delete_board_requires_auth(enable_multiuser_for_tests: Any, client: TestClient):
+    """Test that deleting a board requires authentication."""
+    response = client.delete("/api/v1/boards/some-board-id")
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_list_board_image_names_requires_auth(enable_multiuser_for_tests: Any, client: TestClient):
+    """Test that listing board image names requires authentication."""
+    response = client.get("/api/v1/boards/some-board-id/image_names")
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+# ---------------------------------------------------------------------------
+# Basic create / list tests
+# ---------------------------------------------------------------------------
+
+
+def test_create_board_with_auth(client: TestClient, admin_token: str):
+    """Test that authenticated users can create boards."""
+    response = client.post(
+        "/api/v1/boards/?board_name=My+Test+Board",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    data = response.json()
+    assert data["board_name"] == "My Test Board"
+    assert "board_id" in data
+
+
+def test_list_boards_with_auth(client: TestClient, admin_token: str):
+    """Test that authenticated users can list their boards."""
+    # First create a board
+    client.post(
+        "/api/v1/boards/?board_name=Listed+Board",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    # Now list boards
+    response = client.get(
+        "/api/v1/boards/?all=true",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    boards = response.json()
+    assert isinstance(boards, list)
+    board_names = [b["board_name"] for b in boards]
+    assert "Listed Board" in board_names
+
+
+def test_user_boards_are_isolated(client: TestClient, admin_token: str, user1_token: str):
+    """Test that boards are isolated between users."""
+    # Admin creates a board
+    admin_response = client.post(
+        "/api/v1/boards/?board_name=Admin+Board",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert admin_response.status_code == status.HTTP_201_CREATED
+
+    # Admin can see their own board
+    list_response = client.get(
+        "/api/v1/boards/?all=true",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert list_response.status_code == status.HTTP_200_OK
+    boards = list_response.json()
+    board_names = [b["board_name"] for b in boards]
+    assert "Admin Board" in board_names
+
+    # user1 should not see admin's board in their own listing
+    user1_list = client.get(
+        "/api/v1/boards/?all=true",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert user1_list.status_code == status.HTTP_200_OK
+    user1_board_names = [b["board_name"] for b in user1_list.json()]
+    assert "Admin Board" not in user1_board_names
+
+
+# ---------------------------------------------------------------------------
+# Ownership enforcement: get_board
+# ---------------------------------------------------------------------------
+
+
+def test_get_board_owner_succeeds(client: TestClient, user1_token: str):
+    """Test that the board owner can retrieve their own board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.get(
+        f"/api/v1/boards/{board_id}",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["board_id"] == board_id
+
+
+def test_get_board_other_user_forbidden(client: TestClient, user1_token: str, user2_token: str):
+    """A non-owner cannot retrieve another user's restricted board. The refusal is a 403, not the 404 a missing
+    board answers: clients drop their selection and cached items on a 404, and this refusal can be reversed."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Private+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.get(
+        f"/api/v1/boards/{board_id}",
+        headers={"Authorization": f"Bearer {user2_token}"},
+    )
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["detail"] == {"code": "board_unreadable", "message": "Not authorized to access this board"}
+
+
+def test_get_board_admin_can_access_any_board(client: TestClient, admin_token: str, user1_token: str):
+    """Test that an admin can retrieve any user's board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Board+For+Admin",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.get(
+        f"/api/v1/boards/{board_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+
+# ---------------------------------------------------------------------------
+# Ownership enforcement: update_board
+# ---------------------------------------------------------------------------
+
+
+def test_update_board_owner_succeeds(client: TestClient, user1_token: str):
+    """Test that the board owner can update their own board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=Original+Name",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_name": "Updated Name"},
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.json()["board_name"] == "Updated Name"
+
+
+def test_update_board_other_user_forbidden(client: TestClient, user1_token: str, user2_token: str):
+    """Test that a non-owner cannot update another user's board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Board+To+Update",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_name": "Hijacked Name"},
+        headers={"Authorization": f"Bearer {user2_token}"},
+    )
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+def test_update_board_admin_can_update_any_board(client: TestClient, admin_token: str, user1_token: str):
+    """Test that an admin can update any user's board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Board+Admin+Update",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_name": "Admin Updated Name"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.json()["board_name"] == "Admin Updated Name"
+
+
+# ---------------------------------------------------------------------------
+# Ownership enforcement: delete_board
+# ---------------------------------------------------------------------------
+
+
+def test_delete_board_owner_succeeds(client: TestClient, user1_token: str):
+    """Test that the board owner can delete their own board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=Board+To+Delete",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.delete(
+        f"/api/v1/boards/{board_id}",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["board_id"] == board_id
+
+
+def test_delete_board_other_user_forbidden(client: TestClient, user1_token: str, user2_token: str):
+    """Test that a non-owner cannot delete another user's board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Board+To+Delete",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.delete(
+        f"/api/v1/boards/{board_id}",
+        headers={"Authorization": f"Bearer {user2_token}"},
+    )
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+def test_delete_board_admin_can_delete_any_board(client: TestClient, admin_token: str, user1_token: str):
+    """Test that an admin can delete any user's board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Board+Admin+Delete",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.delete(
+        f"/api/v1/boards/{board_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+
+# ---------------------------------------------------------------------------
+# Ownership enforcement: list_all_board_image_names
+# ---------------------------------------------------------------------------
+
+
+def test_list_board_image_names_owner_succeeds(client: TestClient, user1_token: str):
+    """Test that the board owner can list image names for their board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Images+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.get(
+        f"/api/v1/boards/{board_id}/image_names",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert isinstance(response.json(), list)
+
+
+def test_list_board_image_names_other_user_forbidden(client: TestClient, user1_token: str, user2_token: str):
+    """Test that a non-owner cannot list image names for another user's board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Private+Images+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.get(
+        f"/api/v1/boards/{board_id}/image_names",
+        headers={"Authorization": f"Bearer {user2_token}"},
+    )
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+def test_list_board_image_names_admin_can_access_any_board(client: TestClient, admin_token: str, user1_token: str):
+    """Test that an admin can list image names for any user's board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Board+Admin+Images",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.get(
+        f"/api/v1/boards/{board_id}/image_names",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+
+def test_list_board_image_names_missing_board_returns_404_for_admin(
+    client: TestClient, admin_token: str, mock_invoker: Invoker
+):
+    """Admins must not enumerate image names for a board that does not exist."""
+    response = client.get(
+        "/api/v1/boards/missing-board/image_names",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    mock_invoker.services.board_images.get_all_board_image_names_for_board.assert_not_called()
+
+
+def test_list_board_image_names_none_board_no_auth_check(enable_multiuser_for_tests: Any, client: TestClient):
+    """Test that listing image names for the 'none' board requires auth but no ownership check."""
+    # The 'none' board is the uncategorized images board — no ownership check needed,
+    # but auth is still required in multiuser mode.
+    response = client.get("/api/v1/boards/none/image_names")
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+# ---------------------------------------------------------------------------
+# Misc tests
+# ---------------------------------------------------------------------------
+
+
+def test_enqueue_batch_requires_auth(enable_multiuser_for_tests: Any, client: TestClient):
+    """Test that enqueuing a batch requires authentication."""
+    response = client.post(
+        "/api/v1/queue/default/enqueue_batch",
+        json={
+            "batch": {
+                "batch_id": "test-batch",
+                "data": [],
+                "graph": {"nodes": {}, "edges": []},
+            },
+            "prepend": False,
+        },
+    )
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+# ---------------------------------------------------------------------------
+# Board visibility tests
+# ---------------------------------------------------------------------------
+
+
+def test_board_created_with_private_visibility(client: TestClient, user1_token: str):
+    """Test that newly created boards default to private visibility."""
+    create = client.post(
+        "/api/v1/boards/?board_name=Visibility+Default+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    data = create.json()
+    assert data["board_visibility"] == "private"
+
+
+def test_set_board_visibility_shared(client: TestClient, user1_token: str):
+    """Test that the board owner can set their board to shared."""
+    create = client.post(
+        "/api/v1/boards/?board_name=Shared+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_visibility": "shared"},
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.json()["board_visibility"] == "shared"
+
+
+def test_set_board_visibility_public(client: TestClient, user1_token: str):
+    """Test that the board owner can set their board to public."""
+    create = client.post(
+        "/api/v1/boards/?board_name=Public+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_visibility": "public"},
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.json()["board_visibility"] == "public"
+
+
+def test_shared_board_visible_to_other_users(client: TestClient, user1_token: str, user2_token: str):
+    """Test that a shared board is accessible to other authenticated users."""
+    # user1 creates a board and sets it to shared
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Shared+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_visibility": "shared"},
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+
+    # user2 should be able to access the shared board
+    response = client.get(
+        f"/api/v1/boards/{board_id}",
+        headers={"Authorization": f"Bearer {user2_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["board_id"] == board_id
+
+
+def test_public_board_visible_to_other_users(client: TestClient, user1_token: str, user2_token: str):
+    """Test that a public board is accessible to other authenticated users."""
+    # user1 creates a board and sets it to public
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Public+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_visibility": "public"},
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+
+    # user2 should be able to access the public board
+    response = client.get(
+        f"/api/v1/boards/{board_id}",
+        headers={"Authorization": f"Bearer {user2_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["board_id"] == board_id
+
+
+def test_shared_board_appears_in_other_user_list(client: TestClient, user1_token: str, user2_token: str):
+    """Test that shared boards appear in other users' board listings."""
+    # user1 creates and shares a board
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Listed+Shared+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_visibility": "shared"},
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+
+    # user2 should see the shared board in their listing
+    response = client.get(
+        "/api/v1/boards/?all=true",
+        headers={"Authorization": f"Bearer {user2_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    board_ids = [b["board_id"] for b in response.json()]
+    assert board_id in board_ids
+
+
+def test_private_board_not_visible_after_privacy_change(client: TestClient, user1_token: str, user2_token: str):
+    """Test that reverting a board from shared to private hides it from other users."""
+    # user1 creates a board, makes it shared, then reverts to private
+    create = client.post(
+        "/api/v1/boards/?board_name=Reverted+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_visibility": "shared"},
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_visibility": "private"},
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+
+    # user2 should not be able to access the now-private board
+    response = client.get(
+        f"/api/v1/boards/{board_id}",
+        headers={"Authorization": f"Bearer {user2_token}"},
+    )
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+def test_non_owner_cannot_change_board_visibility(client: TestClient, user1_token: str, user2_token: str):
+    """Test that a non-owner cannot change a board's visibility."""
+    # user1 creates a board
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Private+Locked+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    # user2 tries to make it public - should be forbidden
+    response = client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_visibility": "public"},
+        headers={"Authorization": f"Bearer {user2_token}"},
+    )
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+def test_shared_board_image_names_visible_to_other_users(client: TestClient, user1_token: str, user2_token: str):
+    """Test that image names for shared boards are accessible to other users."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Shared+Images+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_visibility": "shared"},
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+
+    # user2 can access image names for a shared board
+    response = client.get(
+        f"/api/v1/boards/{board_id}/image_names",
+        headers={"Authorization": f"Bearer {user2_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+
+def test_admin_can_change_any_board_visibility(client: TestClient, admin_token: str, user1_token: str):
+    """Test that an admin can change the visibility of any user's board."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Board+For+Admin+Visibility",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    # Admin sets it to public
+    response = client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"board_visibility": "public"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    assert response.json()["board_visibility"] == "public"
+
+
+# ---------------------------------------------------------------------------
+# Video cascade on board deletion (PR #9163 review fix)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_board_with_include_images_cascades_videos(client: TestClient, mock_invoker: Invoker, user1_token: str):
+    """include_images=true must also destroy the board's videos (not image-only)."""
+    create = client.post(
+        "/api/v1/boards/?board_name=Cascade+Test+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    # Membership is enumerated before the board is deleted (the board FK cascades the rows
+    # away), then those exact names are destroyed.
+    mock_invoker.services.board_video_records.get_all_board_video_names_for_board.return_value = [
+        "video_a.mp4",
+        "video_b.mp4",
+    ]
+    # The cascade returns the names of videos it actually deleted; the router must surface
+    # *that* list (not the pre-delete enumeration) so the response can't claim a video was
+    # destroyed when its DB record was preserved due to a file-delete failure.
+    mock_invoker.services.videos.delete_videos_by_names.return_value = (["video_a.mp4", "video_b.mp4"], [])
+
+    response = client.delete(
+        f"/api/v1/boards/{board_id}?include_images=true",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["board_id"] == board_id
+    assert set(body["deleted_videos"]) == {"video_a.mp4", "video_b.mp4"}
+    mock_invoker.services.videos.delete_videos_by_names.assert_called_once_with(["video_a.mp4", "video_b.mp4"])
+
+
+def test_delete_board_with_partial_video_file_delete_failure_reports_only_actual_deletes(
+    client: TestClient, mock_invoker: Invoker, user1_token: str
+):
+    """JPPhoto PR #9163 May-22 follow-up: ``delete_board`` previously reported every video
+    that *would have been* deleted, but ``delete_videos_on_board`` now intentionally preserves
+    records whose backing files failed to delete (so the file isn't orphaned on disk). The
+    response must therefore report only the videos that were actually destroyed; preserved
+    records cascade to "uncategorized" via the board_videos FK and the frontend must learn
+    they still exist so the cache stays consistent.
+    """
+    create = client.post(
+        "/api/v1/boards/?board_name=Partial+Failure+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    # The service deleted "good.mp4" successfully but preserved "stuck.mp4" because its
+    # file delete failed. The router must NOT claim "stuck.mp4" was deleted, and must
+    # report the failure from the service's own accounting (not a racy listing diff).
+    mock_invoker.services.images.delete_images_by_names.return_value = (["good.png"], ["stuck.png"])
+    mock_invoker.services.videos.delete_videos_by_names.return_value = (["good.mp4"], ["stuck.mp4"])
+
+    response = client.delete(
+        f"/api/v1/boards/{board_id}?include_images=true",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["deleted_images"] == ["good.png"]
+    assert body["failed_images"] == ["stuck.png"]
+    assert body["deleted_videos"] == ["good.mp4"]
+    assert body["failed_videos"] == ["stuck.mp4"]
+
+
+@pytest.mark.parametrize("failure_phase", ["videos", "board"])
+def test_delete_board_reports_partial_cascade_completion(
+    client: TestClient, mock_invoker: Invoker, user1_token: str, failure_phase: str
+):
+    """The board is deleted before its media, so which phase failed decides what survives.
+
+    A board that cannot be deleted must leave every image and video intact — that ordering is
+    what stops a project's media being destroyed by a delete the board itself would refuse.
+    """
+    create = client.post(
+        "/api/v1/boards/?board_name=Partial+Cascade+Failure",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+    mock_invoker.services.images.delete_images_by_names.return_value = (["deleted.png"], [])
+    mock_invoker.services.videos.delete_videos_by_names.return_value = (["deleted.mp4"], [])
+    if failure_phase == "videos":
+        mock_invoker.services.videos.delete_videos_by_names.side_effect = RuntimeError("video delete failed")
+
+    board_delete_patch = (
+        patch.object(
+            mock_invoker.services.boards, "delete_if_unclaimed", side_effect=RuntimeError("board delete failed")
+        )
+        if failure_phase == "board"
+        else nullcontext()
+    )
+    with board_delete_patch:
+        response = client.delete(
+            f"/api/v1/boards/{board_id}?include_images=true",
+            headers={"Authorization": f"Bearer {user1_token}"},
+        )
+
+    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    detail = response.json()["detail"]
+    if failure_phase == "board":
+        assert detail["board_deleted"] is False
+        # Nothing was touched: the media deletion never ran.
+        assert detail["deleted_images"] == []
+        assert detail["deleted_videos"] == []
+        mock_invoker.services.images.delete_images_by_names.assert_not_called()
+        mock_invoker.services.videos.delete_videos_by_names.assert_not_called()
+    else:
+        assert detail["board_deleted"] is True
+        assert detail["deleted_images"] == ["deleted.png"]
+        assert detail["deleted_videos"] == []
+
+
+def test_delete_board_with_include_images_filters_cascade_by_user(
+    client: TestClient, mock_invoker: Invoker, user1_token: str
+):
+    """A non-admin board owner deleting a public/shared board with include_images=True must
+    only destroy videos and images they themselves uploaded — other users' contributions are
+    preserved (they fall through to ``uncategorized`` via the FK cascade on board_videos /
+    board_images).
+
+    This guards against a privilege-escalation gap: previously the cascade iterated *all*
+    board_videos rows for the board_id regardless of uploader, letting the board owner
+    delete other users' files just by deleting the board.
+    """
+    create = client.post(
+        "/api/v1/boards/?board_name=Public+Cascade+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.delete(
+        f"/api/v1/boards/{board_id}?include_images=true",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+    # The router must pass the current user's id through to the enumeration — which is now what
+    # narrows the cascade, since the names it captures are exactly the ones later destroyed.
+    # Admins skip the filter (pass ``user_id=None``); this test exercises the non-admin path.
+    images_call = mock_invoker.services.board_images.get_all_board_image_names_for_board.call_args
+    videos_call = mock_invoker.services.board_video_records.get_all_board_video_names_for_board.call_args
+    requester_id = images_call.kwargs.get("user_id")
+    assert requester_id is not None
+    # Both enumerations must share the same user_id (the requester).
+    assert videos_call.kwargs.get("user_id") == requester_id
+
+
+def test_an_admin_deleting_someone_elses_board_with_its_media_deletes_everyones(
+    client: TestClient, mock_invoker: Invoker, admin_token: str, user1_token: str
+):
+    """Only the admin override deletes other users' media: an admin deleting another user's board, the case the
+    board DTO reports as `admin_override` so the client can warn first. The enumeration is unfiltered
+    (``user_id=None``), so the names it captures and later destroys are everyone's."""
+    create = client.post(
+        "/api/v1/boards/?board_name=User1+Cascade+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    response = client.delete(
+        f"/api/v1/boards/{board_id}?include_images=true",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+    images_call = mock_invoker.services.board_images.get_all_board_image_names_for_board.call_args
+    videos_call = mock_invoker.services.board_video_records.get_all_board_video_names_for_board.call_args
+    assert images_call.kwargs.get("user_id") is None
+    assert videos_call.kwargs.get("user_id") is None
+
+
+def test_an_admin_deleting_their_own_board_with_its_media_deletes_only_their_own(
+    client: TestClient, mock_invoker: Invoker, admin_token: str
+):
+    """An admin deleting their own shared board is an owner like any other: only their own uploads are destroyed,
+    and other members' items fall back to Uncategorized, reported neither as deleted nor as failed."""
+    admin = mock_invoker.services.users.get_by_email("admin@test.com")
+    assert admin is not None
+    create = client.post(
+        "/api/v1/boards/?board_name=Admin+Cascade+Board",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+    # What the admin's own enumeration finds: a member's "theirs.png" is not among it.
+    mock_invoker.services.board_images.get_all_board_image_names_for_board.return_value = ["mine.png"]
+    mock_invoker.services.board_video_records.get_all_board_video_names_for_board.return_value = ["mine.mp4"]
+    mock_invoker.services.images.delete_images_by_names.return_value = (["mine.png"], [])
+    mock_invoker.services.videos.delete_videos_by_names.return_value = (["mine.mp4"], [])
+
+    response = client.delete(
+        f"/api/v1/boards/{board_id}?include_images=true",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    images_call = mock_invoker.services.board_images.get_all_board_image_names_for_board.call_args
+    videos_call = mock_invoker.services.board_video_records.get_all_board_video_names_for_board.call_args
+    assert images_call.kwargs.get("user_id") == admin.user_id
+    assert videos_call.kwargs.get("user_id") == admin.user_id
+    mock_invoker.services.images.delete_images_by_names.assert_called_once_with(["mine.png"])
+    mock_invoker.services.videos.delete_videos_by_names.assert_called_once_with(["mine.mp4"])
+    body = response.json()
+    assert (body["deleted_images"], body["failed_images"]) == (["mine.png"], [])
+    assert (body["deleted_videos"], body["failed_videos"]) == (["mine.mp4"], [])
+
+
+def test_delete_board_without_include_images_lists_uncategorized_videos(
+    client: TestClient, mock_invoker: Invoker, user1_token: str
+):
+    """include_images=false: videos cascade out of board_videos and become uncategorized.
+
+    The response now reports those names in deleted_board_videos so the frontend can
+    invalidate the right caches.
+    """
+    create = client.post(
+        "/api/v1/boards/?board_name=Soft+Delete+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board_id = create.json()["board_id"]
+
+    mock_invoker.services.board_video_records.get_all_board_video_names_for_board.return_value = ["v1.mp4"]
+
+    response = client.delete(
+        f"/api/v1/boards/{board_id}",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    body = response.json()
+    assert body["deleted_board_videos"] == ["v1.mp4"]
+    # delete_videos_on_board MUST NOT be invoked when include_images is false.
+    mock_invoker.services.videos.delete_videos_on_board.assert_not_called()
+
+
+def test_delete_board_is_offloaded_by_fastapi() -> None:
+    assert not inspect.iscoroutinefunction(delete_board)
+
+
+# ---------------------------------------------------------------------------
+# Project-owned boards: the generic routes must not touch them
+# ---------------------------------------------------------------------------
+
+
+def _claim_board_for_a_project(client: TestClient, mock_invoker: Invoker, token: str, name: str) -> str:
+    """Create a board and hand it to a new project, returning the board id."""
+    create = client.post(
+        f"/api/v1/boards/?board_name={name}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert create.status_code == status.HTTP_201_CREATED
+    board = create.json()
+    mock_invoker.services.project_records.create(
+        user_id=board["user_id"],
+        name="Owning project",
+        data={},
+        board_id=board["board_id"],
+    )
+    return board["board_id"]
+
+
+def test_a_claimed_board_is_its_projects_inbox(client: TestClient, mock_invoker: Invoker, user1_token: str):
+    board_id = _claim_board_for_a_project(client, mock_invoker, user1_token, "Claimed+Board")
+
+    response = client.get(f"/api/v1/boards/{board_id}", headers={"Authorization": f"Bearer {user1_token}"})
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["project_id"] is not None
+    assert response.json()["is_inbox"] is True
+
+    listed = client.get("/api/v1/boards/?all=true", headers={"Authorization": f"Bearer {user1_token}"})
+    claimed = [b for b in listed.json() if b["board_id"] == board_id]
+    assert len(claimed) == 1
+    assert claimed[0]["is_inbox"] is True
+
+
+def test_an_unclaimed_board_omits_the_project_id(client: TestClient, user1_token: str):
+    """`BoardRecord` excludes nulls, so a plain board must simply not carry the field."""
+    create = client.post(
+        "/api/v1/boards/?board_name=Plain+Board",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+    assert create.json().get("project_id") is None
+
+
+def test_setting_only_the_cover_of_a_project_board_is_still_allowed(
+    client: TestClient, mock_invoker: Invoker, mock_sqlite_database: Database, user1_token: str
+):
+    """The cover is a display detail with no bearing on the project relationship."""
+    board_id = _claim_board_for_a_project(client, mock_invoker, user1_token, "Cover+Board")
+    # `boards.cover_image_name` is a foreign key, so the image has to actually exist.
+    with sqlite_cursor(mock_sqlite_database) as cursor:
+        cursor.execute(
+            "INSERT INTO images (image_name, image_origin, image_category, width, height)"
+            " VALUES ('cover.png', 'internal', 'general', 64, 64);"
+        )
+
+    response = client.patch(
+        f"/api/v1/boards/{board_id}",
+        json={"cover_image_name": "cover.png"},
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+
+    assert response.status_code == status.HTTP_201_CREATED
+
+
+@pytest.mark.parametrize(
+    ("changes", "unchanged"),
+    [
+        ({"board_name": "Raced rename"}, {"board_name": "Claimed during PATCH"}),
+        ({"archived": True}, {"archived": False}),
+        ({"board_visibility": "public"}, {"board_visibility": "private"}),
+    ],
+)
+def test_board_update_cannot_race_a_project_claim(
+    client: TestClient,
+    mock_invoker: Invoker,
+    monkeypatch: pytest.MonkeyPatch,
+    user1_token: str,
+    changes: dict[str, Any],
+    unchanged: dict[str, Any],
+):
+    """The claimed-board check and mutation must be one database decision.
+
+    Deciding access on an unclaimed board and claiming it immediately afterwards pins the race without
+    sleeps or threads: an unconditional update sees stale state, while a conditional write cannot.
+    """
+    created = client.post(
+        "/api/v1/boards/?board_name=Unclaimed",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    ).json()
+    board_id = created["board_id"]
+    original_get_dto = mock_invoker.services.boards.get_dto
+    original_access = mock_invoker.services.board_access.get
+    did_claim = False
+
+    def get_then_claim(board_id: str, user_id: str, is_admin: bool):
+        nonlocal did_claim
+        access = original_access(board_id, user_id, is_admin)
+        if not did_claim:
+            did_claim = True
+            mock_invoker.services.project_records.create(
+                user_id=created["user_id"],
+                name="Claimed during PATCH",
+                data={},
+                board_id=board_id,
+            )
+        return access
+
+    monkeypatch.setattr(mock_invoker.services.board_access, "get", get_then_claim)
+
+    response = client.patch(
+        f"/api/v1/boards/{board_id}",
+        json=changes,
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    board = original_get_dto(board_id, viewer=BoardViewer(user_id=created["user_id"], is_admin=False))
+    for field, value in unchanged.items():
+        assert getattr(board, field) == value
+
+
+@pytest.mark.parametrize("include_images", [False, True])
+def test_a_member_board_deletes_like_any_other(
+    client: TestClient, mock_invoker: Invoker, user1_token: str, include_images: bool
+):
+    """Only the inbox is protected; a project's other boards go through the ordinary deletion, media and all."""
+    inbox_id = _claim_board_for_a_project(client, mock_invoker, user1_token, "Inbox")
+    project_id = client.get(f"/api/v1/boards/{inbox_id}", headers={"Authorization": f"Bearer {user1_token}"}).json()[
+        "project_id"
+    ]
+    member = client.post(
+        f"/api/v1/boards/?board_name=Member&project_id={project_id}",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    ).json()
+    mock_invoker.services.board_images.get_all_board_image_names_for_board.return_value = ["member.png"]
+    mock_invoker.services.images.delete_images_by_names.return_value = (["member.png"], [])
+
+    response = client.delete(
+        f"/api/v1/boards/{member['board_id']}?include_images={'true' if include_images else 'false'}",
+        headers={"Authorization": f"Bearer {user1_token}"},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    if include_images:
+        mock_invoker.services.images.delete_images_by_names.assert_called_once_with(["member.png"])
+        assert response.json()["deleted_images"] == ["member.png"]
+    else:
+        mock_invoker.services.images.delete_images_by_names.assert_not_called()
+        assert response.json()["deleted_board_images"] == ["member.png"]
+    assert (
+        client.get(f"/api/v1/boards/{inbox_id}", headers={"Authorization": f"Bearer {user1_token}"}).status_code
+        == status.HTTP_200_OK
+    )
+
+
+@pytest.mark.parametrize("include_images", [False, True])
+def test_generic_deletion_of_a_project_board_is_refused_without_touching_media(
+    client: TestClient, mock_invoker: Invoker, user1_token: str, admin_token: str, include_images: bool
+):
+    """The refusal must land before any media is destroyed — that is the whole point of
+    enumerating first and deleting the board second."""
+    board_id = _claim_board_for_a_project(client, mock_invoker, user1_token, "Undeletable+Board")
+    mock_invoker.services.board_images.get_all_board_image_names_for_board.return_value = ["keep.png"]
+    mock_invoker.services.board_video_records.get_all_board_video_names_for_board.return_value = ["keep.mp4"]
+
+    for token in (user1_token, admin_token):
+        response = client.delete(
+            f"/api/v1/boards/{board_id}?include_images={'true' if include_images else 'false'}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == status.HTTP_409_CONFLICT
+
+    mock_invoker.services.images.delete_images_by_names.assert_not_called()
+    mock_invoker.services.videos.delete_videos_by_names.assert_not_called()
+    # The board is still there.
+    assert (
+        client.get(f"/api/v1/boards/{board_id}", headers={"Authorization": f"Bearer {user1_token}"}).status_code
+        == status.HTTP_200_OK
+    )
+
+
+# --- Roles in the board DTO --------------------------------------------------------------------
+
+
+def _auth(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _create(client: TestClient, token: str, name: str, project_id: str | None = None) -> dict[str, Any]:
+    query = f"board_name={name}" + (f"&project_id={project_id}" if project_id else "")
+    response = client.post(f"/api/v1/boards/?{query}", headers=_auth(token))
+    assert response.status_code == status.HTTP_201_CREATED
+    return response.json()
+
+
+def test_the_board_dto_describes_the_callers_access(
+    client: TestClient, user1_token: str, user2_token: str, admin_token: str
+):
+    """Clients gate their interface on allowed_actions; my_role and admin_override are for display."""
+    board = _create(client, user1_token, "Contributions")
+    client.patch(
+        f"/api/v1/boards/{board['board_id']}", json={"general_access": "contributor"}, headers=_auth(user1_token)
+    )
+
+    def described(token: str) -> tuple[Any, ...]:
+        dto = client.get(f"/api/v1/boards/{board['board_id']}", headers=_auth(token)).json()
+        return dto["my_role"], set(dto["allowed_actions"]), dto["admin_override"], dto["owner_username"]
+
+    assert described(user1_token) == ("owner", _ALL_ACTIONS, False, "User One")
+    assert described(user2_token) == ("contributor", {"read", "add_media"}, False, "User One")
+    assert described(admin_token) == ("contributor", _ALL_ACTIONS, True, "User One")
+
+
+_ALL_ACTIONS = {
+    "read",
+    "add_media",
+    "manage_items",
+    "rename",
+    "set_cover",
+    "archive",
+    "set_general_access",
+    "move",
+    "delete",
+}
+
+
+def test_only_the_owner_and_admins_learn_a_shared_boards_project(
+    client: TestClient, mock_invoker: Invoker, user1_token: str, user2_token: str, admin_token: str
+):
+    user1 = client.get("/api/v1/auth/me", headers=_auth(user1_token)).json()["user_id"]
+    project = mock_invoker.services.project_records.create(user1, "Atlas", {}).model_dump()
+    board = _create(client, user1_token, "Panels", project["project_id"])
+    client.patch(f"/api/v1/boards/{board['board_id']}", json={"general_access": "viewer"}, headers=_auth(user1_token))
+
+    def project_of(token: str) -> Any:
+        return client.get(f"/api/v1/boards/{board['board_id']}", headers=_auth(token)).json().get("project_id")
+
+    assert (project_of(user1_token), project_of(admin_token), project_of(user2_token)) == (
+        project["project_id"],
+        project["project_id"],
+        None,
+    )
+    listed = client.get("/api/v1/boards/?all=true", headers=_auth(user2_token)).json()
+    assert [dto.get("project_id") for dto in listed if dto["board_id"] == board["board_id"]] == [None]
+
+
+@pytest.mark.parametrize(
+    ("visibility", "general_access"), [("private", "restricted"), ("shared", "viewer"), ("public", "contributor")]
+)
+def test_the_deprecated_board_visibility_is_general_access_under_its_old_name(
+    client: TestClient, user1_token: str, visibility: str, general_access: str
+):
+    board = _create(client, user1_token, "Legacy")
+
+    updated = client.patch(
+        f"/api/v1/boards/{board['board_id']}", json={"board_visibility": visibility}, headers=_auth(user1_token)
+    ).json()
+
+    assert (updated["general_access"], updated["board_visibility"]) == (general_access, visibility)
+
+
+def test_a_change_may_name_general_access_once(client: TestClient, user1_token: str):
+    board = _create(client, user1_token, "Both")
+
+    response = client.patch(
+        f"/api/v1/boards/{board['board_id']}",
+        json={"board_visibility": "public", "general_access": "viewer"},
+        headers=_auth(user1_token),
+    )
+
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
+def test_editors_manage_a_board_but_only_its_owner_changes_who_can_open_it(
+    client: TestClient, mock_sqlite_database: Database, user1_token: str, user2_token: str
+):
+    board = _create(client, user1_token, "Managed")
+    user2 = client.get("/api/v1/auth/me", headers=_auth(user2_token)).json()["user_id"]
+    with sqlite_cursor(mock_sqlite_database) as cursor:
+        cursor.execute(
+            "INSERT INTO board_members (board_id, user_id, role) VALUES (?, ?, 'editor')", (board["board_id"], user2)
+        )
+
+    def patch_as_editor(changes: dict[str, Any]) -> int:
+        return client.patch(f"/api/v1/boards/{board['board_id']}", json=changes, headers=_auth(user2_token)).status_code
+
+    assert patch_as_editor({"board_name": "Renamed by editor", "archived": True}) == status.HTTP_201_CREATED
+    with sqlite_cursor(mock_sqlite_database) as cursor:
+        cursor.execute(
+            "INSERT INTO images (image_name, image_origin, image_category, width, height, user_id) "
+            "VALUES ('cover.png', 'internal', 'general', 1, 1, ?)",
+            (user2,),
+        )
+    assert patch_as_editor({"cover_image_name": "cover.png"}) == status.HTTP_201_CREATED
+    assert patch_as_editor({"general_access": "viewer"}) == status.HTTP_403_FORBIDDEN
+    # Moving between the Library and a project is the owner's, in either direction.
+    assert patch_as_editor({"project_id": None}) == status.HTTP_403_FORBIDDEN
+    assert (
+        client.delete(f"/api/v1/boards/{board['board_id']}", headers=_auth(user2_token)).status_code
+        == status.HTTP_403_FORBIDDEN
+    )
+
+
+def test_an_update_that_changes_nothing_still_takes_an_editor(
+    client: TestClient, mock_sqlite_database: Database, user1_token: str, user2_token: str
+):
+    board = _create(client, user1_token, "Untouched")
+    user2 = client.get("/api/v1/auth/me", headers=_auth(user2_token)).json()["user_id"]
+    with sqlite_cursor(mock_sqlite_database) as cursor:
+        cursor.execute(
+            "INSERT INTO board_members (board_id, user_id, role) VALUES (?, ?, 'viewer')", (board["board_id"], user2)
+        )
+
+    response = client.patch(f"/api/v1/boards/{board['board_id']}", json={}, headers=_auth(user2_token))
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+def test_a_board_shared_with_someone_else_stays_closed_to_everyone_else(
+    client: TestClient, mock_invoker: Invoker, mock_sqlite_database: Database, user1_token: str, user2_token: str
+):
+    board = _create(client, user1_token, "Shared with one")
+    setup_test_user(mock_invoker, "user3@test.com", "User Three", is_admin=False)
+    user3_token = get_user_token(client, "user3@test.com")
+    user2 = client.get("/api/v1/auth/me", headers=_auth(user2_token)).json()["user_id"]
+    with sqlite_cursor(mock_sqlite_database) as cursor:
+        cursor.execute(
+            "INSERT INTO board_members (board_id, user_id, role) VALUES (?, ?, 'editor')", (board["board_id"], user2)
+        )
+
+    assert client.get(f"/api/v1/boards/{board['board_id']}", headers=_auth(user2_token)).status_code == 200
+    assert client.get(f"/api/v1/boards/{board['board_id']}", headers=_auth(user3_token)).status_code == 403
+    assert (
+        client.patch(
+            f"/api/v1/boards/{board['board_id']}", json={"board_name": "Taken"}, headers=_auth(user3_token)
+        ).status_code
+        == 403
+    )

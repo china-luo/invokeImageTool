@@ -1,0 +1,18 @@
+name: 'label PRs'
+on:
+  - pull_request_target
+
+jobs:
+  labeler:
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: checkout
+        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+
+      - name: label PRs
+        uses: actions/labeler@v6
+        with:
+          configuration-path: .github/pr_labels.yml

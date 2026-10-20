@@ -1,0 +1,538 @@
+from enum import Enum
+from typing import Dict, TypeAlias, Union
+
+import onnxruntime as ort
+import torch
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from pydantic import TypeAdapter
+
+from invokeai.backend.raw_model import RawModel
+
+# ModelMixin is the base class for all diffusers and transformers models
+# RawModel is the InvokeAI wrapper class for ip_adapters, loras, textual_inversion and onnx runtime
+AnyModel: TypeAlias = Union[
+    ModelMixin,
+    RawModel,
+    torch.nn.Module,
+    Dict[str, torch.Tensor],
+    DiffusionPipeline,
+    ort.InferenceSession,
+]
+"""Type alias for any kind of runtime, in-memory model representation. For example, a torch module or diffusers pipeline."""
+
+
+class BaseModelType(str, Enum):
+    """An enumeration of base model architectures. For example, Stable Diffusion 1.x, Stable Diffusion 2.x, FLUX, etc.
+
+    Every model config must have a base architecture type.
+
+    Not all models are associated with a base architecture. For example, CLIP models are their own thing, not related
+    to any particular model architecture. To simplify internal APIs and make it easier to work with models, we use a
+    fallback/null value `BaseModelType.Any` for these models, instead of making the model base optional."""
+
+    Any = "any"
+    """`Any` is essentially a fallback/null value for models with no base architecture association.
+    For example, CLIP models are not related to Stable Diffusion, FLUX, or any other model arch."""
+    StableDiffusion1 = "sd-1"
+    """Indicates the model is associated with the Stable Diffusion 1.x model architecture, including 1.4 and 1.5."""
+    StableDiffusion2 = "sd-2"
+    """Indicates the model is associated with the Stable Diffusion 2.x model architecture, including 2.0 and 2.1."""
+    StableDiffusion3 = "sd-3"
+    """Indicates the model is associated with the Stable Diffusion 3.5 model architecture."""
+    StableDiffusionXL = "sdxl"
+    """Indicates the model is associated with the Stable Diffusion XL model architecture."""
+    StableDiffusionXLRefiner = "sdxl-refiner"
+    """Indicates the model is associated with the Stable Diffusion XL Refiner model architecture."""
+    Flux = "flux"
+    """Indicates the model is associated with FLUX.1 model architecture, including FLUX Dev, Schnell and Fill."""
+    Flux2 = "flux2"
+    """Indicates the model is associated with FLUX.2 model architecture, including FLUX.2 Klein and FLUX.2 [dev]."""
+    CogView4 = "cogview4"
+    """Indicates the model is associated with CogView 4 model architecture."""
+    ZImage = "z-image"
+    """Indicates the model is associated with Z-Image model architecture, including Z-Image-Turbo."""
+    ErnieImage = "ernie-image"
+    """Indicates the model is associated with Baidu ERNIE-Image, including ERNIE-Image-Turbo."""
+    Ideogram4 = "ideogram-4"
+    """Indicates the model is associated with the Ideogram 4 text-to-image model architecture."""
+    External = "external"
+    """Indicates the model is hosted by an external provider."""
+    QwenImage = "qwen-image"
+    """Indicates the model is associated with Qwen Image Edit 2511 model architecture."""
+    Anima = "anima"
+    """Indicates the model is associated with Anima model architecture (Cosmos Predict2 DiT + LLM Adapter)."""
+    QwenImage21 = "qwen-image-2-1"
+    """Indicates the model is associated with the Qwen-Image-2.1 architecture: a single-stream DiT on a 64-channel,
+    16x RGBA VAE, conditioned by Qwen3-VL-8B. Unrelated to `QwenImage` beyond the name."""
+    Krea2 = "krea-2"
+    """Indicates the model is associated with the Krea 2 model architecture, including Krea-2-Turbo."""
+    Wan = "wan"
+    """Indicates the model is associated with the Wan 2.2 model architecture (T2V-A14B / TI2V-5B), used for image generation at num_frames=1."""
+    MiniMaxH3 = "minimax-h3"
+    """Indicates the model is associated with the MiniMax H3 (Hailuo 3.0) omni-modal architecture, which
+    generates video with jointly-denoised stereo audio."""
+    LTX2 = "ltx-2"
+    """Indicates the model is associated with the Lightricks LTX-2 family (LTX-2.5 in this version), a
+    dual-stream video+audio DiT conditioned by a Gemma text encoder through learned connectors."""
+    Unknown = "unknown"
+    """Indicates the model's base architecture is unknown."""
+
+
+class ModelType(str, Enum):
+    """Model type."""
+
+    ONNX = "onnx"
+    Main = "main"
+    VAE = "vae"
+    LoRA = "lora"
+    ControlLoRa = "control_lora"
+    ControlNet = "controlnet"  # used by model_probe
+    TextualInversion = "embedding"
+    IPAdapter = "ip_adapter"
+    CLIPVision = "clip_vision"
+    CLIPEmbed = "clip_embed"
+    T2IAdapter = "t2i_adapter"
+    T5Encoder = "t5_encoder"
+    Qwen3Encoder = "qwen3_encoder"
+    QwenVLEncoder = "qwen_vl_encoder"
+    Qwen3VLEncoder = "qwen3_vl_encoder"
+    Qwen35Encoder = "qwen3_5_encoder"
+    MistralEncoder = "mistral_encoder"
+    WanT5Encoder = "wan_t5_encoder"
+    Gemma2Encoder = "gemma2_encoder"
+    Gemma4Encoder = "gemma4_encoder"
+    SpandrelImageToImage = "spandrel_image_to_image"
+    SigLIP = "siglip"
+    FluxRedux = "flux_redux"
+    LlavaOnevision = "llava_onevision"
+    PromptEnhancer = "prompt_enhancer"
+    TextLLM = "text_llm"
+    ExternalImageGenerator = "external_image_generator"
+    PiDDecoder = "pid_decoder"
+    LTX2DurationHead = "ltx2_duration_head"
+    Unknown = "unknown"
+
+
+class SubModelType(str, Enum):
+    """Submodel type."""
+
+    UNet = "unet"
+    Transformer = "transformer"
+    Transformer2 = "transformer_2"
+    TextEncoder = "text_encoder"
+    TextEncoder2 = "text_encoder_2"
+    TextEncoder3 = "text_encoder_3"
+    Tokenizer = "tokenizer"
+    Tokenizer2 = "tokenizer_2"
+    Tokenizer3 = "tokenizer_3"
+    Processor = "processor"
+    PromptEnhancer = "pe"
+    PromptEnhancerTokenizer = "pe_tokenizer"
+    VAE = "vae"
+    VAEDecoder = "vae_decoder"
+    VAEEncoder = "vae_encoder"
+    AudioVAE = "audio_vae"
+    Vocoder = "vocoder"
+    Connectors = "connectors"
+    LatentUpsampler = "latent_upsampler"
+    TemporalLatentUpsampler = "temporal_latent_upsampler"
+    Scheduler = "scheduler"
+    SafetyChecker = "safety_checker"
+
+
+class ClipVariantType(str, Enum):
+    """Variant type."""
+
+    L = "large"
+    G = "gigantic"
+
+
+class ModelVariantType(str, Enum):
+    """Variant type."""
+
+    Normal = "normal"
+    Inpaint = "inpaint"
+    Depth = "depth"
+
+
+class FluxVariantType(str, Enum):
+    """FLUX.1 model variants."""
+
+    Schnell = "schnell"
+    Dev = "dev"
+    DevFill = "dev_fill"
+
+
+class Flux2VariantType(str, Enum):
+    """FLUX.2 model variants."""
+
+    Klein4B = "klein_4b"
+    """Flux2 Klein 4B variant using Qwen3 4B text encoder (distilled)."""
+
+    Klein4BBase = "klein_4b_base"
+    """Flux2 Klein 4B Base variant - undistilled foundation model using Qwen3 4B text encoder."""
+
+    Klein9B = "klein_9b"
+    """Flux2 Klein 9B variant using Qwen3 8B text encoder (distilled)."""
+
+    Klein9BBase = "klein_9b_base"
+    """Flux2 Klein 9B Base variant - undistilled foundation model using Qwen3 8B text encoder."""
+
+    Dev = "dev"
+    """FLUX.2 [dev] - 32B rectified flow transformer using Mistral Small 3.1 text encoder (guidance-distilled)."""
+
+
+class ZImageVariantType(str, Enum):
+    """Z-Image model variants."""
+
+    Turbo = "turbo"
+    """Z-Image Turbo - distilled model optimized for 8 steps, no CFG support."""
+
+    ZBase = "zbase"
+    """Z-Image Base - undistilled foundation model with full CFG and negative prompt support."""
+
+
+class Krea2VariantType(str, Enum):
+    """Krea 2 model variants."""
+
+    Turbo = "krea2_turbo"
+    """Krea-2-Turbo - distilled model optimized for 8 steps with CFG disabled (guidance_scale=0).
+
+    NOTE: the value is ``krea2_turbo`` (not ``turbo``) to avoid colliding with
+    ``ZImageVariantType.Turbo`` in the variant-string adapter and frontend label maps."""
+
+    Base = "krea2_base"
+    """Krea-2-Raw - undistilled base model. Runs with more steps (~28) and CFG enabled (~4.5),
+    using resolution-aware timestep shifting (``is_distilled=false`` in model_index.json).
+
+    NOTE: the value is ``krea2_base`` (not ``base``) for the same disambiguation reason as ``Turbo``."""
+
+
+class QwenImage21VariantType(str, Enum):
+    """Qwen-Image-2.1 variants. The weights share one architecture; what differs is the sampling schedule."""
+
+    Base = "qwen_image_21_base"
+    """The released model: 40 steps on a resolution-shifted schedule with a terminal shift."""
+
+    Turbo = "qwen_image_21_turbo"
+    """Qwen-Image-2.1-Turbo: distilled for 8 steps on a fixed sigma table, CFG off."""
+
+
+class QwenImageVariantType(str, Enum):
+    """Qwen Image model variants."""
+
+    Generate = "generate"
+    """Qwen Image - text-to-image generation model."""
+
+    Edit = "edit"
+    """Qwen Image Edit - image editing model with reference image support."""
+
+
+class WanVariantType(str, Enum):
+    """Wan 2.2 model variants.
+
+    All variants are used for image generation at num_frames=1. The A14B family
+    is a Mixture-of-Experts (high-noise + low-noise) totalling ~28B params; the
+    T2V sub-variant takes text only, while the I2V sub-variant additionally
+    conditions on a reference image (encoded by the VAE and concatenated to the
+    noise latents along the channel dim — its transformer has ``in_channels=36``
+    instead of ``16``). TI2V-5B is a single ~5B transformer with a
+    higher-compression VAE (z_dim=48).
+    """
+
+    T2V_A14B = "t2v_a14b"
+    """Wan 2.2 T2V-A14B - dual-expert MoE (text only, 16-channel Wan VAE, transformer in_channels=16)."""
+
+    I2V_A14B = "i2v_a14b"
+    """Wan 2.2 I2V-A14B - dual-expert MoE with VAE-latent reference-image conditioning (transformer in_channels=36)."""
+
+    TI2V_5B = "ti2v_5b"
+    """Wan 2.2 TI2V-5B - smaller single-transformer model with Wan2.2-VAE (48 latent channels)."""
+
+
+class WanLoRAVariantType(str, Enum):
+    """Wan 2.2 LoRA variants, identifying which model family a LoRA targets.
+
+    Detected from the LoRA's inner attention dim: A14B has ``inner_dim=5120``,
+    TI2V-5B has ``inner_dim=3072``. A14B and 5B LoRAs are NOT interchangeable —
+    applying one against the wrong main model crashes in the layer patcher
+    with a tensor-shape error.
+    """
+
+    A14B = "a14b"
+    """Targets a Wan 2.2 A14B main (T2V or I2V, inner_dim=5120)."""
+
+    Wan5B = "5b"
+    """Targets the Wan 2.2 TI2V-5B main (inner_dim=3072)."""
+
+
+class Qwen3VariantType(str, Enum):
+    """Qwen3 text encoder variants based on model size."""
+
+    Qwen3_4B = "qwen3_4b"
+    """Qwen3 4B text encoder (hidden_size=2560). Used by FLUX.2 Klein 4B and Z-Image."""
+
+    Qwen3_8B = "qwen3_8b"
+    """Qwen3 8B text encoder (hidden_size=4096). Used by FLUX.2 Klein 9B."""
+
+    Qwen3_06B = "qwen3_06b"
+    """Qwen3 0.6B text encoder (hidden_size=1024). Used by Anima."""
+
+
+class Qwen3VLVariantType(str, Enum):
+    """Qwen3-VL (vision-language) text encoder variants, by language-model width.
+
+    Separate from `Qwen3VariantType`: those are the text-only Qwen3 encoders (Z-Image, FLUX.2
+    Klein). The VL models carry a visual tower and are not interchangeable with them, and the two
+    families do not even share widths at the same parameter count.
+    """
+
+    Qwen3VL_4B = "qwen3_vl_4b"
+    """Qwen3-VL 4B (hidden_size=2560, 36 layers). The encoder Krea-2 conditions on."""
+
+    Qwen3VL_8B = "qwen3_vl_8b"
+    """Qwen3-VL 8B (hidden_size=4096, 36 layers). The encoder Ideogram 4 conditions on, tapping 13
+    of its layers for a 53248-wide feature vector."""
+
+
+class Qwen35VariantType(str, Enum):
+    """Qwen3.5 text encoder variants, by language-model width.
+
+    A family of its own: Qwen3.5 interleaves Gated DeltaNet linear-attention layers with gated full
+    attention, so its checkpoints share neither architecture nor key layout with `Qwen3VariantType`,
+    even at the same width.
+    """
+
+    Qwen35_4B = "qwen3_5_4b"
+    """Qwen3.5 4B (hidden_size=2560, 32 layers). Anima-3.8B's semantic encoder, read at layers 7/15/23/31."""
+
+
+class AnimaVariantType(str, Enum):
+    """Anima model variants, by how the transformer is conditioned.
+
+    The depth of the DiT (28 blocks for the official release, 40 for Anima-2.9B, 52 for Anima-3.8B)
+    is not a variant: the loader reads it from the checkpoint and nothing else depends on it.
+    """
+
+    Qwen3 = "anima_qwen3"
+    """Conditioned on Qwen3 0.6B through the native LLM adapter. Every release by CircleStone Labs
+    and Anima-2.9B."""
+
+    Qwen35 = "anima_qwen35"
+    """Additionally conditioned on Qwen3.5 4B through a bundled, timestep-aware semantic connector
+    (Anima-3.8B v1.1). Needs both encoders, and the connector runs at every denoising step."""
+
+
+class MiniMaxH3VariantType(str, Enum):
+    """MiniMax H3 model variants (task-specific transformer checkpoints sharing every other component)."""
+
+    FL2VA = "fl2va"
+    """First/last-frame + text to audio-video: text-to-video and first/last-frame image-to-video
+    (HF repo subfolder ``transformer``)."""
+
+    REF2VA = "ref2va"
+    """Multi-reference to audio-video: up to 3 video + 9 image references condition generation
+    (HF repo subfolder ``transformer_ref``). Same architecture and config as FL2VA, different
+    weights; supports only the reference task."""
+
+
+class LTX2VariantType(str, Enum):
+    """LTX-2 transformer variants. Dev and Distilled are key-for-key identical checkpoints of the same
+    architecture; the variant decides the sampling recipe (guided ~40-step schedule vs the fixed
+    8-sigma distilled schedule with CFG off), so it must travel with the model record.
+
+    Values carry the family prefix because variant values are globally unique across enums
+    (`FluxVariantType.Dev` already owns "dev")."""
+
+    Dev = "ltx2_dev"
+    """The guided model: CFG / STG / modality-isolation guidance over a shifted flow schedule."""
+
+    Distilled = "ltx2_distilled"
+    """The step-distilled model: fixed 8-sigma schedule, no guidance, no negative prompt."""
+
+
+class MistralVariantType(str, Enum):
+    """Mistral text encoder variants used by FLUX.2 [dev] and ERNIE-Image."""
+
+    Cow = "cow_mistral3_small"
+    """The 30-layer BFL "cow-mistral3-small" distillation (hidden_size=5120).
+    Hidden states are sampled at indices (10, 20, 30) which on a 30-layer model
+    hit 1/3, 2/3, and the final layer. ComfyUI's reference implementation
+    drops the final RMSNorm for this variant (``final_norm=False``), so the
+    loader strips ``model.norm`` after loading the weights."""
+
+    Mistral24B = "mistral3_24b"
+    """The 40-layer Mistral Small 3 (24B, hidden_size=5120) text encoder BFL
+    ships in the canonical ``black-forest-labs/FLUX.2-dev/text_encoder``. Same
+    extraction indices (10, 20, 30), final RMSNorm kept enabled. Architecturally
+    identical to upstream ``mistralai/Mistral-Small-3.1/3.2`` — installing one
+    of those instead of BFL's release will load fine but produces visibly
+    weaker prompt adherence than the cow distillation, so the cow variants
+    remain the recommended default."""
+
+    Ministral3B = "ministral3_3b"
+    """The 26-layer Ministral 3B (hidden_size=3072) ERNIE-Image encodes its
+    prompts with. A different model family from the two above, not a smaller
+    build of them: it is loaded as ``Ministral3Model`` and uses YaRN RoPE
+    scaling, so the geometry alone decides the variant. The final RMSNorm is
+    kept — ERNIE reads the second-to-last hidden state, which the norm never
+    touches."""
+
+
+class PiDDecoderVariantType(str, Enum):
+    """PiD (Pixel Diffusion Decoder) resolution presets distributed by NVIDIA.
+
+    Supported backbones are FLUX.1, FLUX.2, SD3, SDXL and Qwen-Image. Not every backbone ships both
+    presets: FLUX.1 / FLUX.2 / SD3 have both the 2K and the 2K-to-4K preset, while SDXL and Qwen-Image
+    ship only the 2K-to-4K preset. The presets differ only in target output resolution; the underlying
+    (legacy) network is the same. NVIDIA's checkpoint filenames encode this as e.g.
+    `PiD_res2k_sr4x_official_flux_distill_4step` vs `PiD_res2kto4k_sr4x_official_flux_distill_4step`.
+    """
+
+    Res2k_Sr4x = "res2k_sr4x"
+    """Standard 2K target preset (decodes to ~2K via 4x super-resolution)."""
+
+    Res2kTo4k_Sr4x = "res2kto4k_sr4x"
+    """Upsampling preset (designed for chaining to push ~2K inputs to ~4K)."""
+
+
+class ModelFormat(str, Enum):
+    """Storage format of model."""
+
+    OMI = "omi"
+    Diffusers = "diffusers"
+    Checkpoint = "checkpoint"
+    LyCORIS = "lycoris"
+    ONNX = "onnx"
+    Olive = "olive"
+    EmbeddingFile = "embedding_file"
+    EmbeddingFolder = "embedding_folder"
+    InvokeAI = "invokeai"
+    T5Encoder = "t5_encoder"
+    Qwen3Encoder = "qwen3_encoder"
+    QwenVLEncoder = "qwen_vl_encoder"
+    Qwen3VLEncoder = "qwen3_vl_encoder"
+    MistralEncoder = "mistral_encoder"
+    WanT5Encoder = "wan_t5_encoder"
+    Gemma2Encoder = "gemma2_encoder"
+    Gemma4Encoder = "gemma4_encoder"
+    BnbQuantizedLlmInt8b = "bnb_quantized_int8b"
+    BnbQuantizednf4b = "bnb_quantized_nf4b"
+    GGUFQuantized = "gguf_quantized"
+    ExternalApi = "external_api"
+    SDNQQuantized = "sdnq_quantized"
+    Unknown = "unknown"
+
+
+QUANTIZED_MODEL_FORMATS: frozenset[ModelFormat] = frozenset(
+    {
+        ModelFormat.GGUFQuantized,
+        ModelFormat.BnbQuantizednf4b,
+        ModelFormat.BnbQuantizedLlmInt8b,
+        ModelFormat.SDNQQuantized,
+    }
+)
+"""Formats whose weights are already quantized: packed payloads FP8 Storage must never re-encode."""
+
+
+class SchedulerPredictionType(str, Enum):
+    """Scheduler prediction type."""
+
+    Epsilon = "epsilon"
+    VPrediction = "v_prediction"
+    Sample = "sample"
+
+
+class ModelRepoVariant(str, Enum):
+    """Various hugging face variants on the diffusers format."""
+
+    Default = ""  # model files without "fp16" or other qualifier
+    FP16 = "fp16"
+    FP32 = "fp32"
+    ONNX = "onnx"
+    OpenVINO = "openvino"
+    Flax = "flax"
+
+
+class ModelSourceType(str, Enum):
+    """Model source type."""
+
+    Path = "path"
+    Url = "url"
+    HFRepoID = "hf_repo_id"
+    External = "external"
+
+
+class FluxLoRAFormat(str, Enum):
+    """Flux LoRA formats."""
+
+    Diffusers = "flux.diffusers"
+    Kohya = "flux.kohya"
+    OneTrainer = "flux.onetrainer"
+    Control = "flux.control"
+    AIToolkit = "flux.aitoolkit"
+    XLabs = "flux.xlabs"
+    BflPeft = "flux.bfl_peft"
+    OneTrainerBfl = "flux.onetrainer_bfl"
+
+
+AnyVariant: TypeAlias = Union[
+    ModelVariantType,
+    ClipVariantType,
+    FluxVariantType,
+    Flux2VariantType,
+    ZImageVariantType,
+    QwenImageVariantType,
+    WanVariantType,
+    WanLoRAVariantType,
+    Qwen3VariantType,
+    Qwen3VLVariantType,
+    Qwen35VariantType,
+    AnimaVariantType,
+    Krea2VariantType,
+    QwenImage21VariantType,
+    MiniMaxH3VariantType,
+    LTX2VariantType,
+    MistralVariantType,
+    PiDDecoderVariantType,
+]
+variant_type_adapter = TypeAdapter[
+    ModelVariantType
+    | ClipVariantType
+    | FluxVariantType
+    | Flux2VariantType
+    | ZImageVariantType
+    | QwenImageVariantType
+    | WanVariantType
+    | WanLoRAVariantType
+    | Qwen3VariantType
+    | Qwen3VLVariantType
+    | Qwen35VariantType
+    | AnimaVariantType
+    | Krea2VariantType
+    | QwenImage21VariantType
+    | MiniMaxH3VariantType
+    | LTX2VariantType
+    | MistralVariantType
+    | PiDDecoderVariantType
+](
+    ModelVariantType
+    | ClipVariantType
+    | FluxVariantType
+    | Flux2VariantType
+    | ZImageVariantType
+    | QwenImageVariantType
+    | WanVariantType
+    | WanLoRAVariantType
+    | Qwen3VariantType
+    | Qwen3VLVariantType
+    | Qwen35VariantType
+    | AnimaVariantType
+    | Krea2VariantType
+    | QwenImage21VariantType
+    | MiniMaxH3VariantType
+    | LTX2VariantType
+    | MistralVariantType
+    | PiDDecoderVariantType
+)

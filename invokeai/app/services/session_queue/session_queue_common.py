@@ -1,0 +1,887 @@
+import datetime
+import json
+from collections.abc import Mapping
+from itertools import chain, product
+from typing import Any, Generator, Literal, NamedTuple, Optional, TypeAlias, Union
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    StrictStr,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
+from pydantic_core import to_jsonable_python
+
+from invokeai.app.invocations.fields import ImageField, VideoField
+from invokeai.app.services.shared.execution_effects import normalize_persisted_execution_effects
+from invokeai.app.services.shared.execution_state_migration import (
+    CURRENT_EXECUTION_STATE_VERSION,
+    UnsupportedExecutionStateVersionError,
+    dump_execution_state,
+    load_execution_state,
+)
+from invokeai.app.services.shared.graph import Graph, GraphExecutionState, NodeNotFoundError
+from invokeai.app.services.workflow_records.workflow_records_common import (
+    WorkflowWithoutID,
+    WorkflowWithoutIDValidator,
+)
+from invokeai.app.util.misc import uuid_string
+
+# region Errors
+
+
+class BatchZippedLengthError(ValueError):
+    """Raise when a batch has items of different lengths."""
+
+
+class BatchItemsTypeError(ValueError):  # this cannot be a TypeError in pydantic v2
+    """Raise when a batch has items of different types."""
+
+
+class BatchDuplicateNodeFieldError(ValueError):
+    """Raise when a batch has duplicate node_path and field_name."""
+
+
+class EnqueueIdempotencyConflictError(ValueError):
+    """Raise when a caller reuses an enqueue idempotency key for a different submission."""
+
+
+class EnqueueReceiptLimitError(RuntimeError):
+    """Raise when a caller has too many unacknowledged enqueue requests."""
+
+
+class EnqueueProjectNotFoundError(ValueError):
+    """Raise when a project-scoped enqueue names no project owned by the caller."""
+
+    def __init__(self, project_id: str) -> None:
+        super().__init__(f"Project {project_id} not found")
+
+
+class TooManySessionsError(ValueError):
+    """Raise when too many sessions are requested."""
+
+
+class SessionQueueItemNotFoundError(ValueError):
+    """Raise when a queue item is not found."""
+
+
+class SessionQueueItemChangedError(ValueError):
+    """Raise when a guarded queue-item update loses a concurrent state transition."""
+
+
+# endregion
+
+
+# region Batch
+
+BatchScalarDataType = Union[StrictStr, float, int, ImageField, VideoField]
+BatchDataType = Union[BatchScalarDataType, list[BatchScalarDataType]]
+
+
+class NodeFieldValue(BaseModel):
+    node_path: str = Field(description="The node into which this batch data item will be substituted.")
+    field_name: str = Field(description="The field into which this batch data item will be substituted.")
+    value: BatchDataType = Field(description="The value to substitute into the node/field.")
+
+
+class BatchDatum(BaseModel):
+    node_path: str = Field(description="The node into which this batch data collection will be substituted.")
+    field_name: str = Field(description="The field into which this batch data collection will be substituted.")
+    items: list[BatchDataType] = Field(
+        default_factory=list, description="The list of items to substitute into the node/field."
+    )
+
+
+BatchDataCollection: TypeAlias = list[list[BatchDatum]]
+
+
+class Batch(BaseModel):
+    batch_id: str = Field(default_factory=uuid_string, max_length=255, description="The ID of the batch")
+    idempotency_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description="A caller-owned retry key. Reusing it with a different payload is rejected.",
+    )
+    project_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description="The authoritative project that owns this submission, when applicable.",
+    )
+    origin: str | None = Field(
+        default=None,
+        description="The origin of this queue item. This data is used by the frontend to determine how to handle results.",
+    )
+    destination: str | None = Field(
+        default=None,
+        description="The origin of this queue item. This data is used by the frontend to determine how to handle results",
+    )
+    data: Optional[BatchDataCollection] = Field(default=None, description="The batch data collection.")
+    graph: Graph = Field(description="The graph to initialize the session with")
+    workflow: Optional[WorkflowWithoutID] = Field(
+        default=None, description="The workflow to initialize the session with"
+    )
+    runs: int = Field(
+        default=1, ge=1, description="Int stating how many times to iterate through all possible batch indices"
+    )
+
+    @field_validator("data")
+    def validate_lengths(cls, v: Optional[BatchDataCollection]):
+        if v is None:
+            return v
+        for batch_data_list in v:
+            first_item_length = len(batch_data_list[0].items) if batch_data_list and batch_data_list[0].items else 0
+            for i in batch_data_list:
+                if len(i.items) != first_item_length:
+                    raise BatchZippedLengthError("Zipped batch items must all have the same length")
+        return v
+
+    @field_validator("data")
+    def validate_types(cls, v: Optional[BatchDataCollection]):
+        if v is None:
+            return v
+        for batch_data_list in v:
+            for datum in batch_data_list:
+                if not datum.items:
+                    continue
+
+                # Special handling for numbers - they can be mixed
+                # TODO(psyche): Update BatchDatum to have a `type` field to specify the type of the items, then we can have strict float and int fields
+                if all(isinstance(item, (int, float)) for item in datum.items):
+                    continue
+
+                # Get the type of the first item in the list
+                first_item_type = type(datum.items[0])
+                for item in datum.items:
+                    if type(item) is not first_item_type:
+                        raise BatchItemsTypeError("All items in a batch must have the same type")
+        return v
+
+    @field_validator("data")
+    def validate_unique_field_mappings(cls, v: Optional[BatchDataCollection]):
+        if v is None:
+            return v
+        paths: set[tuple[str, str]] = set()
+        for batch_data_list in v:
+            for datum in batch_data_list:
+                pair = (datum.node_path, datum.field_name)
+                if pair in paths:
+                    raise BatchDuplicateNodeFieldError("Each batch data must have unique node_id and field_name")
+                paths.add(pair)
+        return v
+
+    @model_validator(mode="after")
+    def validate_batch_nodes_and_edges(self):
+        if self.data is None:
+            return self
+        for batch_data_list in self.data:
+            for batch_data in batch_data_list:
+                try:
+                    node = self.graph.get_node(batch_data.node_path)
+                except NodeNotFoundError:
+                    raise NodeNotFoundError(f"Node {batch_data.node_path} not found in graph")
+                if batch_data.field_name not in type(node).model_fields:
+                    raise NodeNotFoundError(f"Field {batch_data.field_name} not found in node {batch_data.node_path}")
+        return self
+
+    @field_validator("graph")
+    def validate_graph(cls, v: Graph):
+        v.validate_self()
+        return v
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "required": [
+                "graph",
+                "runs",
+            ]
+        }
+    )
+
+
+# endregion Batch
+
+
+# region Queue Items
+
+DEFAULT_QUEUE_ID = "default"
+SYSTEM_USER_ID = "system"  # Default user_id for system-generated queue items
+
+QUEUE_ITEM_STATUS = Literal["pending", "in_progress", "waiting", "completed", "failed", "canceled"]
+
+
+class ItemIdsResult(BaseModel):
+    """Response containing ordered item ids with metadata for optimistic updates."""
+
+    item_ids: list[int] = Field(description="Ordered list of item ids")
+    total_count: int = Field(
+        description="Number of ids in item_ids. Equals the number of matching items only when no limit is given; "
+        "use the queue status for totals"
+    )
+
+
+NodeFieldValueValidator = TypeAdapter(list[NodeFieldValue])
+
+
+def get_field_values(queue_item_dict: dict) -> Optional[list[NodeFieldValue]]:
+    field_values_raw = queue_item_dict.get("field_values", None)
+    return NodeFieldValueValidator.validate_json(field_values_raw) if field_values_raw is not None else None
+
+
+def get_session(queue_item_dict: dict) -> GraphExecutionState:
+    session_raw = queue_item_dict.get("session", "{}")
+    session_payload = json.loads(session_raw) if isinstance(session_raw, str) else session_raw
+    return load_execution_state(session_payload)
+
+
+def _normalize_queue_read_effects(payload: dict[str, Any], *, normalize_effects: bool) -> None:
+    if normalize_effects and "execution_effects" in payload:
+        payload["execution_effects"] = normalize_persisted_execution_effects(payload["execution_effects"])
+
+    child_payload = payload.get("waiting_workflow_call_child_session")
+    if not isinstance(child_payload, Mapping):
+        return
+
+    child_payload = dict(child_payload)
+    child_state = child_payload.get("state")
+    if isinstance(child_payload.get("version"), int) and isinstance(child_state, Mapping):
+        child_state = dict(child_state)
+        _normalize_queue_read_effects(child_state, normalize_effects=normalize_effects)
+        child_payload["state"] = child_state
+    else:
+        _normalize_queue_read_effects(child_payload, normalize_effects=normalize_effects)
+    payload["waiting_workflow_call_child_session"] = child_payload
+
+
+def get_session_for_queue_read(queue_item_dict: dict) -> GraphExecutionState:
+    """Build a response-shaped session without rehydrating runtime execution state."""
+    session_raw = queue_item_dict.get("session", "{}")
+    session_payload = json.loads(session_raw) if isinstance(session_raw, str) else dict(session_raw)
+    if "version" in session_payload and isinstance(session_payload.get("state"), Mapping):
+        version = session_payload["version"]
+        session_payload = dict(session_payload["state"])
+    else:
+        version = session_payload.pop("execution_state_version", None)
+
+    if version is not None:
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError("Execution state snapshot version must be an integer")
+        if version > CURRENT_EXECUTION_STATE_VERSION:
+            raise UnsupportedExecutionStateVersionError(
+                f"Execution state snapshot version {version} is newer than supported version "
+                f"{CURRENT_EXECUTION_STATE_VERSION}"
+            )
+
+    graph_payload = session_payload.get("graph")
+    if not isinstance(graph_payload, Mapping):
+        raise ValueError("Queue session projection is missing a graph mapping")
+    session_payload["graph"] = Graph.model_validate(graph_payload, strict=False)
+    execution_graph_payload = session_payload.get("execution_graph")
+    if isinstance(execution_graph_payload, Mapping):
+        session_payload["execution_graph"] = Graph.model_validate(execution_graph_payload, strict=False)
+    _normalize_queue_read_effects(session_payload, normalize_effects=version != 0)
+
+    return GraphExecutionState.model_validate(session_payload, context={"queue_read_projection": True})
+
+
+def get_workflow(queue_item_dict: dict) -> Optional[WorkflowWithoutID]:
+    workflow_raw = queue_item_dict.get("workflow", None)
+    if workflow_raw is not None:
+        workflow = WorkflowWithoutIDValidator.validate_json(workflow_raw, strict=False)
+        return workflow
+    return None
+
+
+class FieldIdentifier(BaseModel):
+    kind: Literal["input", "output"] = Field(description="The kind of field")
+    node_id: str = Field(description="The ID of the node")
+    field_name: str = Field(description="The name of the field")
+    user_label: str | None = Field(description="The user label of the field, if any")
+
+
+class SessionQueueItem(BaseModel):
+    """Session queue item without the full graph. Used for serialization."""
+
+    _snapshot_readable: bool = PrivateAttr(default=True)
+    _session_json: str | None = PrivateAttr(default=None)
+    _workflow_json_snapshot: str | None = PrivateAttr(default=None)
+    _workflow_json_loaded: bool = PrivateAttr(default=False)
+
+    item_id: int = Field(description="The identifier of the session queue item")
+    status: QUEUE_ITEM_STATUS = Field(default="pending", description="The status of this queue item")
+    status_sequence: int | None = Field(
+        default=None,
+        # Fallback for rows serialized before migration_28 added the DB-level default of 0.
+        description="A monotonically increasing version for this queue item's visible status lifecycle",
+    )
+    priority: int = Field(default=0, description="The priority of this queue item")
+    batch_id: str = Field(description="The ID of the batch associated with this queue item")
+    origin: str | None = Field(
+        default=None,
+        description="The origin of this queue item. This data is used by the frontend to determine how to handle results.",
+    )
+    destination: str | None = Field(
+        default=None,
+        description="The origin of this queue item. This data is used by the frontend to determine how to handle results",
+    )
+    session_id: str = Field(
+        description="The ID of the session associated with this queue item. The session doesn't exist in graph_executions until the queue item is executed."
+    )
+    error_type: Optional[str] = Field(default=None, description="The error type if this queue item errored")
+    error_message: Optional[str] = Field(default=None, description="The error message if this queue item errored")
+    error_traceback: Optional[str] = Field(
+        default=None,
+        description="The error traceback if this queue item errored",
+        validation_alias=AliasChoices("error_traceback", "error"),
+    )
+    created_at: Union[datetime.datetime, str] = Field(description="When this queue item was created")
+    updated_at: Union[datetime.datetime, str] = Field(description="When this queue item was updated")
+    started_at: Optional[Union[datetime.datetime, str]] = Field(description="When this queue item was started")
+    completed_at: Optional[Union[datetime.datetime, str]] = Field(description="When this queue item was completed")
+    queue_id: str = Field(description="The id of the queue with which this item is associated")
+    user_id: str = Field(default="system", description="The id of the user who created this queue item")
+    project_id: Optional[str] = Field(
+        default=None, description="The project this queue item was enqueued for, if any; its outputs inherit it"
+    )
+    user_display_name: Optional[str] = Field(
+        default=None, description="The display name of the user who created this queue item, if available"
+    )
+    user_email: Optional[str] = Field(
+        default=None, description="The email of the user who created this queue item, if available"
+    )
+    field_values: Optional[list[NodeFieldValue]] = Field(
+        default=None, description="The field values that were used for this queue item"
+    )
+    retried_from_item_id: Optional[int] = Field(
+        default=None, description="The item_id of the queue item that this item was retried from"
+    )
+    device: Optional[str] = Field(
+        default=None,
+        description="The device that processed this queue item, e.g. 'cuda:1' (set only when running on a GPU)",
+    )
+    workflow_call_id: Optional[str] = Field(
+        default=None, description="The active workflow-call relationship id when this queue item is a child execution."
+    )
+    parent_item_id: Optional[int] = Field(
+        default=None, description="The parent queue item id when this queue item is a child workflow execution."
+    )
+    parent_session_id: Optional[str] = Field(
+        default=None, description="The parent session id when this queue item is a child workflow execution."
+    )
+    root_item_id: Optional[int] = Field(
+        default=None, description="The root queue item id for this workflow call chain, if any."
+    )
+    workflow_call_depth: Optional[int] = Field(
+        default=None, description="The 1-based workflow-call depth for this queue item when it is a child execution."
+    )
+    session: GraphExecutionState = Field(description="The fully-populated session to be executed")
+    workflow: Optional[WorkflowWithoutID] = Field(
+        default=None, description="The workflow associated with this queue item"
+    )
+
+    @classmethod
+    def queue_item_from_dict(
+        cls,
+        queue_item_dict: dict,
+        *,
+        hydrate_runtime: bool = True,
+    ) -> "SessionQueueItem":
+        # must parse these manually
+        session_json = queue_item_dict.get("session") if isinstance(queue_item_dict.get("session"), str) else None
+        queue_item_dict["field_values"] = get_field_values(queue_item_dict)
+        queue_item_dict["session"] = (
+            get_session(queue_item_dict) if hydrate_runtime else get_session_for_queue_read(queue_item_dict)
+        )
+        queue_item_dict["workflow"] = get_workflow(queue_item_dict)
+        queue_item = SessionQueueItem(**queue_item_dict)
+        queue_item._session_json = session_json
+        return queue_item
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "required": [
+                "item_id",
+                "status",
+                "batch_id",
+                "queue_id",
+                "session_id",
+                "session",
+                "priority",
+                "session_id",
+                "created_at",
+                "updated_at",
+            ]
+        }
+    )
+
+
+class SessionQueueItemSummary(BaseModel):
+    """Queue item fields needed to render the queue list."""
+
+    item_id: int = Field(description="The identifier of the session queue item")
+    created_at: Union[datetime.datetime, str] = Field(description="When this queue item was created")
+    status: QUEUE_ITEM_STATUS = Field(description="The status of this queue item")
+    device: Optional[str] = Field(
+        default=None,
+        description="The device that processed this queue item, e.g. 'cuda:1'",
+    )
+    started_at: Optional[Union[datetime.datetime, str]] = Field(description="When this queue item was started")
+    completed_at: Optional[Union[datetime.datetime, str]] = Field(description="When this queue item was completed")
+    origin: str | None = Field(description="The origin of this queue item")
+    destination: str | None = Field(description="The destination of this queue item")
+    batch_id: str = Field(description="The ID of the batch associated with this queue item")
+    user_id: str = Field(description="The ID of the user who created this queue item")
+    user_display_name: Optional[str] = Field(description="The display name of the user who created this queue item")
+    user_email: Optional[str] = Field(description="The email of the user who created this queue item")
+    field_values: Optional[list[NodeFieldValue]] = Field(description="The batch field values used for this queue item")
+    # Carried because the list rows decide from it whether to offer a retry: a child item of a
+    # workflow call cannot be retried on its own.
+    parent_item_id: Optional[int] = Field(description="The ID of the parent queue item, if this is a child item")
+
+    @classmethod
+    def queue_item_summary_from_dict(cls, queue_item_dict: dict) -> "SessionQueueItemSummary":
+        try:
+            queue_item_dict["field_values"] = get_field_values(queue_item_dict)
+        except (TypeError, ValueError):
+            # Summaries intentionally omit the runtime session and must remain usable when a
+            # queue row contains an unreadable optional field-values payload.
+            queue_item_dict["field_values"] = None
+        return cls(**queue_item_dict)
+
+
+# endregion Queue Items
+
+# region Query Results
+
+
+class SessionQueueStatus(BaseModel):
+    queue_id: str = Field(..., description="The ID of the queue")
+    item_id: Optional[int] = Field(description="The current queue item id")
+    batch_id: Optional[str] = Field(description="The current queue item's batch id")
+    session_id: Optional[str] = Field(description="The current queue item's session id")
+    pending: int = Field(..., description="Number of queue items with status 'pending'")
+    in_progress: int = Field(..., description="Number of queue items with status 'in_progress'")
+    waiting: int = Field(..., description="Number of queue items with status 'waiting'")
+    completed: int = Field(..., description="Number of queue items with status 'complete'")
+    failed: int = Field(..., description="Number of queue items with status 'error'")
+    canceled: int = Field(..., description="Number of queue items with status 'canceled'")
+    total: int = Field(..., description="Total number of queue items")
+    user_pending: Optional[int] = Field(
+        default=None,
+        description="Number of the requesting user's queue items with status 'pending' (None for global callers)",
+    )
+    user_in_progress: Optional[int] = Field(
+        default=None,
+        description="Number of the requesting user's queue items with status 'in_progress' (None for global callers)",
+    )
+
+
+class SessionQueueCountsByDestination(BaseModel):
+    queue_id: str = Field(..., description="The ID of the queue")
+    destination: str = Field(..., description="The destination of queue items included in this status")
+    pending: int = Field(..., description="Number of queue items with status 'pending' for the destination")
+    in_progress: int = Field(..., description="Number of queue items with status 'in_progress' for the destination")
+    waiting: int = Field(..., description="Number of queue items with status 'waiting' for the destination")
+    completed: int = Field(..., description="Number of queue items with status 'complete' for the destination")
+    failed: int = Field(..., description="Number of queue items with status 'error' for the destination")
+    canceled: int = Field(..., description="Number of queue items with status 'canceled' for the destination")
+    total: int = Field(..., description="Total number of queue items for the destination")
+
+
+class BatchStatus(BaseModel):
+    queue_id: str = Field(..., description="The ID of the queue")
+    batch_id: str = Field(..., description="The ID of the batch")
+    origin: str | None = Field(..., description="The origin of the batch")
+    destination: str | None = Field(..., description="The destination of the batch")
+    pending: int = Field(..., description="Number of queue items with status 'pending'")
+    in_progress: int = Field(..., description="Number of queue items with status 'in_progress'")
+    waiting: int = Field(..., description="Number of queue items with status 'waiting'")
+    completed: int = Field(..., description="Number of queue items with status 'complete'")
+    failed: int = Field(..., description="Number of queue items with status 'error'")
+    canceled: int = Field(..., description="Number of queue items with status 'canceled'")
+    total: int = Field(..., description="Total number of queue items")
+
+
+class EnqueueBatchResult(BaseModel):
+    queue_id: str = Field(description="The ID of the queue")
+    enqueued: int = Field(description="The total number of queue items enqueued")
+    requested: int = Field(description="The total number of queue items requested to be enqueued")
+    batch: Batch = Field(description="The batch that was enqueued")
+    priority: int = Field(description="The priority of the enqueued batch")
+    item_ids: list[int] = Field(description="The IDs of the queue items that were enqueued")
+
+
+class EnqueueBatchReceipt(BaseModel):
+    batch_id: str = Field(min_length=1, description="The ID assigned to the accepted batch")
+    enqueued: int = Field(ge=1, description="The total number of queue items enqueued")
+    requested: int = Field(ge=1, description="The total number of queue items requested")
+    item_ids: list[int] = Field(min_length=1, description="The IDs of the accepted queue items")
+
+    @model_validator(mode="after")
+    def validate_result(self) -> "EnqueueBatchReceipt":
+        if self.enqueued > self.requested:
+            raise ValueError("Enqueued count cannot exceed requested count")
+        if (
+            len(self.item_ids) != self.enqueued
+            or len(set(self.item_ids)) != len(self.item_ids)
+            or any(item_id <= 0 for item_id in self.item_ids)
+        ):
+            raise ValueError("Item ids must contain one positive id per enqueued item")
+        return self
+
+
+class RetriedQueueItem(BaseModel):
+    source_item_id: int = Field(description="The ID of the retried root queue item")
+    item_id: int = Field(description="The ID of the queue item that re-runs it")
+
+
+class RetryItemsResult(BaseModel):
+    queue_id: str = Field(description="The ID of the queue")
+    retried_item_ids: list[int] = Field(description="The IDs of the queue items that were retried")
+    retried_items: list[RetriedQueueItem] = Field(
+        default_factory=list, description="Each retried root queue item with the queue item that re-runs it"
+    )
+
+
+QueueItemDeliveryAction: TypeAlias = Literal["claim", "confirm", "release"]
+QueueItemDeliveryStatus: TypeAlias = Literal["claimed", "delivered", "held", "released"]
+
+
+class QueueItemDeliveryRequest(BaseModel):
+    """A change to who stages a queue item's results, so that only one browser does."""
+
+    action: QueueItemDeliveryAction = Field(
+        description="claim: take delivering the results; confirm: mark them delivered; release: give up a claim"
+    )
+    claimant: str = Field(
+        min_length=1, max_length=128, description="An id the client chooses for the browser tab or run claiming"
+    )
+
+
+class QueueItemOwner(NamedTuple):
+    """The queue a queue item is in and the account that owns it."""
+
+    queue_id: str
+    user_id: str
+
+
+class QueueItemDeliveryResult(BaseModel):
+    """Who stages a queue item's results after a delivery request."""
+
+    status: QueueItemDeliveryStatus = Field(
+        description="claimed: the claimant may deliver; delivered: the results were delivered; "
+        "held: another claimant is delivering them; released: the claimant holds no claim"
+    )
+    retry_after_ms: Optional[int] = Field(
+        default=None, description="When held, how long until the other claim lapses, in milliseconds"
+    )
+
+
+class ClearResult(BaseModel):
+    """Result of clearing the session queue"""
+
+    deleted: int = Field(..., description="Number of queue items deleted")
+
+
+class PruneResult(ClearResult):
+    """Result of pruning the session queue"""
+
+    pass
+
+
+class CancelByBatchIDsResult(BaseModel):
+    """Result of canceling by list of batch ids"""
+
+    canceled: int = Field(..., description="Number of queue items canceled")
+
+
+class CancelByDestinationResult(CancelByBatchIDsResult):
+    """Result of canceling by a destination"""
+
+    pass
+
+
+class DeleteByDestinationResult(BaseModel):
+    """Result of deleting by a destination"""
+
+    deleted: int = Field(..., description="Number of queue items deleted")
+
+
+class DeleteAllExceptCurrentResult(DeleteByDestinationResult):
+    """Result of deleting all except current"""
+
+    pass
+
+
+class CancelByQueueIDResult(CancelByBatchIDsResult):
+    """Result of canceling by queue id"""
+
+    pass
+
+
+class CancelAllExceptCurrentResult(CancelByBatchIDsResult):
+    """Result of canceling all except current"""
+
+    pass
+
+
+class IsEmptyResult(BaseModel):
+    """Result of checking if the session queue is empty"""
+
+    is_empty: bool = Field(..., description="Whether the session queue is empty")
+
+
+class IsFullResult(BaseModel):
+    """Result of checking if the session queue is full"""
+
+    is_full: bool = Field(..., description="Whether the session queue is full")
+
+
+# endregion Query Results
+
+
+# region Util
+
+
+def create_session_nfv_tuples(batch: Batch, maximum: int) -> Generator[tuple[str, str, str], None, None]:
+    """
+    Given a batch and a maximum number of sessions to create, generate a tuple of session_id, session_json, and
+    field_values_json for each session.
+
+    The batch has a "source" graph and a data property. The data property is a list of lists of BatchDatum objects.
+    Each BatchDatum has a field identifier (e.g. a node id and field name), and a list of values to substitute into
+    the field.
+
+    This structure allows us to create a new graph for every possible permutation of BatchDatum objects:
+    - Each BatchDatum can be "expanded" into a dict of node-field-value tuples - one for each item in the BatchDatum.
+    - Zip each inner list of expanded BatchDatum objects together. Call this a "batch_data_list".
+    - Take the cartesian product of all zipped batch_data_lists, resulting in a list of permutations of BatchDatum
+    - Take the cartesian product of all zipped batch_data_lists, resulting in a list of lists of BatchDatum objects.
+        Each inner list now represents the substitution values for a single permutation (session).
+    - For each permutation, substitute the values into the graph
+
+    This function is optimized for performance, as it is used to generate a large number of sessions at once.
+
+    Args:
+        batch: The batch to generate sessions from
+        maximum: The maximum number of sessions to generate
+
+    Returns:
+        A generator that yields tuples of session_id, session_json, and field_values_json for each session. The
+        generator will stop early if the maximum number of sessions is reached.
+    """
+
+    # TODO: Should this be a class method on Batch?
+
+    data: list[list[tuple[dict]]] = []
+    batch_data_collection = batch.data if batch.data is not None else []
+
+    for batch_datum_list in batch_data_collection:
+        node_field_values_to_zip: list[list[dict]] = []
+        # Expand each BatchDatum into a list of dicts - one for each item in the BatchDatum
+        for batch_datum in batch_datum_list:
+            node_field_values = [
+                # Note: A tuple here is slightly faster than a dict, but we need the object in dict form to be inserted
+                # in the session_queue table anyways. So, overall creating NFVs as dicts is faster.
+                {"node_path": batch_datum.node_path, "field_name": batch_datum.field_name, "value": item}
+                for item in batch_datum.items
+            ]
+            node_field_values_to_zip.append(node_field_values)
+        # Zip the dicts together to create a list of dicts for each permutation
+        data.append(list(zip(*node_field_values_to_zip, strict=True)))  # type: ignore [arg-type]
+
+    # We serialize the graph and session once, then mutate the graph dict in place for each session.
+    #
+    # This sounds scary, but it's actually fine.
+    #
+    # The batch prep logic injects field values into the same fields for each generated session.
+    #
+    # For example, after the product operation, we'll end up with a list of node-field-value tuples like this:
+    # [
+    #   (
+    #     {"node_path": "1", "field_name": "a", "value": 1},
+    #     {"node_path": "2", "field_name": "b", "value": 2},
+    #     {"node_path": "3", "field_name": "c", "value": 3},
+    #   ),
+    #   (
+    #     {"node_path": "1", "field_name": "a", "value": 4},
+    #     {"node_path": "2", "field_name": "b", "value": 5},
+    #     {"node_path": "3", "field_name": "c", "value": 6},
+    #   )
+    # ]
+    #
+    # Note that each tuple has the same length, and each tuple substitutes values in for exactly the same node fields.
+    # No matter the complexity of the batch, this property holds true.
+    #
+    # This means each permutation's substitution can be done in-place on the same graph dict, because it overwrites the
+    # previous mutation. We only need to serialize the graph once, and then we can mutate it in place for each session.
+    #
+    # Previously, we had created new Graph objects for each session, but this was very slow for large (1k+ session
+    # batches). We then tried dumping the graph to dict and using deep-copy to create a new dict for each session,
+    # but this was also slow.
+    #
+    # Overall, we achieved a 100x speedup by mutating the graph dict in place for each session over creating new Graph
+    # objects for each session.
+    #
+    # We will also mutate the session dict in place, setting a new ID for each session and setting the mutated graph
+    # dict as the session's graph.
+
+    # Dump the batch's graph to a dict once
+    graph_as_dict = batch.graph.model_dump(warnings=False, exclude_none=True)
+
+    # We must provide a Graph object when creating the "dummy" session dict, but we don't actually use it. It will be
+    # overwritten for each session by the mutated graph_as_dict.
+    session_dict = dump_execution_state(GraphExecutionState(graph=Graph()))
+
+    # Now we can create a generator that yields the session_id, session_json, and field_values_json for each session.
+    count = 0
+
+    # Each batch may have multiple runs, so we need to generate the same number of sessions for each run. The total is
+    # still limited by the maximum number of sessions.
+    for _ in range(batch.runs):
+        for d in product(*data):
+            if count >= maximum:
+                # We've reached the maximum number of sessions we may generate
+                return
+
+            # Flatten the list of lists of dicts into a single list of dicts
+            # TODO(psyche): Is the a more efficient way to do this?
+            flat_node_field_values = list(chain.from_iterable(d))
+
+            # Need a fresh ID for each session
+            session_id = uuid_string()
+
+            # Mutate the session dict in place
+            session_dict["id"] = session_id
+
+            # Substitute the values into the graph
+            for nfv in flat_node_field_values:
+                graph_as_dict["nodes"][nfv["node_path"]][nfv["field_name"]] = nfv["value"]
+
+            # Mutate the session dict in place
+            session_dict["graph"] = graph_as_dict
+
+            # Serialize the session and field values
+            # Note the use of pydantic's to_jsonable_python to handle serialization of any python object, including sets.
+            session_json = json.dumps(session_dict, default=to_jsonable_python)
+            field_values_json = json.dumps(flat_node_field_values, default=to_jsonable_python)
+
+            # Yield the session_id, session_json, and field_values_json
+            yield (session_id, session_json, field_values_json)
+
+            # Increment the count so we know when to stop
+            count += 1
+
+
+def calc_session_count(batch: Batch) -> int:
+    """
+    Calculates the number of sessions that would be created by the batch, without incurring the overhead of actually
+    creating them, as is done in `create_session_nfv_tuples()`.
+
+    The count is used to communicate to the user how many sessions were _requested_ to be created, as opposed to how
+    many were _actually_ created (which may be less due to the maximum number of sessions).
+    """
+    # TODO: Should this be a class method on Batch?
+    if not batch.data:
+        return batch.runs
+    session_count = batch.runs
+    for batch_datum_list in batch.data:
+        group_length = len(batch_datum_list[0].items) if batch_datum_list else 0
+        session_count *= group_length
+    return session_count
+
+
+ValueToInsertTuple: TypeAlias = tuple[
+    str,  # queue_id
+    str,  # session (as stringified JSON)
+    str,  # session_id
+    str,  # batch_id
+    str | None,  # field_values (optional, as stringified JSON)
+    int,  # priority
+    str | None,  # workflow (optional, as stringified JSON)
+    str | None,  # origin (optional)
+    str | None,  # destination (optional)
+    int | None,  # retried_from_item_id (optional, this is always None for new items)
+    str,  # user_id
+    str | None,  # project_id (optional)
+]
+"""A type alias for the tuple of values to insert into the session queue table.
+
+**If you change this, be sure to update the `enqueue_batch` and `retry_items_by_id` methods in the session queue service!**
+"""
+
+
+def prepare_values_to_insert(
+    queue_id: str, batch: Batch, priority: int, max_new_queue_items: int, user_id: str = "system"
+) -> list[ValueToInsertTuple]:
+    """
+    Given a batch, prepare the values to insert into the session queue table. The list of tuples can be used with an
+    `executemany` statement to insert multiple rows at once.
+
+    Args:
+        queue_id: The ID of the queue to insert the items into
+        batch: The batch to prepare the values for
+        priority: The priority of the queue items
+        max_new_queue_items: The maximum number of queue items to insert
+        user_id: The user ID who is creating these queue items
+
+    Returns:
+        A list of tuples to insert into the session queue table. Each tuple contains the following values:
+        - queue_id
+        - session (as stringified JSON)
+        - session_id
+        - batch_id
+        - field_values (optional, as stringified JSON)
+        - priority
+        - workflow (optional, as stringified JSON)
+        - origin (optional)
+        - destination (optional)
+        - retried_from_item_id (optional, this is always None for new items)
+        - user_id
+        - project_id (optional)
+    """
+
+    # A tuple is a fast and memory-efficient way to store the values to insert. Previously, we used a NamedTuple, but
+    # measured a ~5% performance improvement by using a normal tuple instead. For very large batches (10k+ items), the
+    # this difference becomes noticeable.
+    #
+    # So, despite the inferior DX with normal tuples, we use one here for performance reasons.
+
+    values_to_insert: list[ValueToInsertTuple] = []
+
+    # pydantic's to_jsonable_python handles serialization of any python object, including sets, which json.dumps does
+    # not support by default. Apparently there are sets somewhere in the graph.
+
+    # The same workflow is used for all sessions in the batch - serialize it once
+    workflow_json = json.dumps(batch.workflow, default=to_jsonable_python) if batch.workflow else None
+
+    for session_id, session_json, field_values_json in create_session_nfv_tuples(batch, max_new_queue_items):
+        values_to_insert.append(
+            (
+                queue_id,
+                session_json,
+                session_id,
+                batch.batch_id,
+                field_values_json,
+                priority,
+                workflow_json,
+                batch.origin,
+                batch.destination,
+                None,
+                user_id,
+                batch.project_id,
+            )
+        )
+    return values_to_insert
+
+
+# endregion Util
+
+Batch.model_rebuild(force=True)
+SessionQueueItem.model_rebuild(force=True)

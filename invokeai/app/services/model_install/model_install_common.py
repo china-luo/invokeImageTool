@@ -1,0 +1,425 @@
+import errno
+import os
+import re
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from contextlib import contextmanager
+from enum import Enum
+from pathlib import Path
+from typing import Iterator, Literal, Optional, Set, Union
+
+import psutil
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
+from pydantic.networks import AnyHttpUrl
+from typing_extensions import Annotated
+
+from invokeai.app.services.download import DownloadJob, MultiFileDownloadJob
+from invokeai.app.services.model_records import ModelRecordChanges
+from invokeai.backend.model_manager.configs.factory import AnyModelConfig
+from invokeai.backend.model_manager.metadata import AnyModelRepoMetadata
+from invokeai.backend.model_manager.taxonomy import ModelRepoVariant, ModelSourceType
+
+
+class InvalidModelConfigException(Exception):
+    """Raised when a model configuration is invalid."""
+
+    pass
+
+
+INSTALL_RECOVERY_SENTINEL = ".invokeai_install_recovery_required"
+INSTALL_ACTIVE_SENTINEL = ".invokeai_install_active"
+INSTALL_ACTIVE_SCAN_LOCK = ".invokeai_install_claims.lock"
+ACTIVE_CLAIM_SCAN_LOCK_RETRY_INTERVAL_SECONDS = 0.05
+_active_claim_scan_thread_lock = threading.Lock()
+
+
+@contextmanager
+def active_install_claim_scan_lock(models_path: Path) -> Iterator[None]:
+    """Serialize stale-claim scans across threads and processes using a stable lock file."""
+    with _active_claim_scan_thread_lock:
+        lock_path = models_path / INSTALL_ACTIVE_SCAN_LOCK
+        with open(lock_path, "a+b") as lock_file:
+            if os.name == "nt":
+                import msvcrt
+
+                lock_file.seek(0, os.SEEK_END)
+                if lock_file.tell() == 0:
+                    lock_file.write(b"\0")
+                    lock_file.flush()
+                lock_file.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as e:
+                        if e.errno not in {errno.EACCES, errno.EDEADLK, errno.EAGAIN}:
+                            raise
+                        time.sleep(ACTIVE_CLAIM_SCAN_LOCK_RETRY_INTERVAL_SECONDS)
+                try:
+                    yield
+                finally:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+class InstallCancellationConflictError(RuntimeError):
+    """The install cannot be cancelled safely in its current state."""
+
+
+class InstallDownloadConflictError(RuntimeError):
+    """A prior remote download still owns this install's staging directory."""
+
+
+class InstallRecoveryRequiredError(InstallCancellationConflictError):
+    """Install transfer could not be safely rolled back; preserve both recovery roots."""
+
+
+def recovery_sentinel_path(root: Path) -> Path:
+    """Return the sidecar marker path that protects an install recovery root."""
+    return root.parent / f".{root.name}{INSTALL_RECOVERY_SENTINEL}"
+
+
+def active_install_sentinel_path(root: Path) -> Path:
+    """Return the sidecar marker used to coordinate an active install with orphan cleanup."""
+    return root.parent / f".{root.name}{INSTALL_ACTIVE_SENTINEL}"
+
+
+def has_recovery_sentinel(root: Path) -> bool:
+    """Return whether an install recovery root has a durable preservation marker."""
+    return recovery_sentinel_path(root).exists()
+
+
+def has_active_install_sentinel(root: Path) -> bool:
+    """Return whether a live install or orphan deletion has claimed this path."""
+    return active_install_sentinel_path(root).exists()
+
+
+def _linux_process_start_identity(pid: int) -> str:
+    """Return process identity fields unaffected by wall-clock changes."""
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    stat = Path(f"/proc/{pid}/stat").read_bytes()
+    fields = stat.rsplit(b")", 1)[1].split()
+    if len(fields) <= 19:
+        raise ValueError(f"Unexpected /proc/{pid}/stat format")
+    start_ticks = fields[19].decode("ascii")
+    return f"linux:{boot_id}:{start_ticks}"
+
+
+def create_active_install_sentinel(root: Path) -> None:
+    """Atomically claim a path against concurrent install or orphan-delete operations."""
+    path = active_install_sentinel_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            process = psutil.Process()
+            payload = f"{process.pid} {process.create_time()!r}"
+            if sys.platform == "linux":
+                payload += f" {_linux_process_start_identity(process.pid)}"
+            f.write(f"{payload}\n".encode("ascii"))
+            f.flush()
+            os.fsync(f.fileno())
+        # A hard link publishes the complete payload atomically and fails if another owner won.
+        os.link(temp_path, path)
+    except BaseException:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    else:
+        # Once linked, cleanup cannot make publication fail for the owner.
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def delete_active_install_sentinel(root: Path) -> None:
+    """Release an active install or orphan-delete claim."""
+    try:
+        active_install_sentinel_path(root).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def is_recovery_protected_path(path: Path, boundary: Path) -> bool:
+    """Return whether a path is protected by an active install claim or recovery marker."""
+    boundary = boundary.resolve()
+    current = path.resolve()
+    while current != boundary and current.is_relative_to(boundary):
+        if has_recovery_sentinel(current) or has_active_install_sentinel(current):
+            return True
+        current = current.parent
+    return False
+
+
+class InstallStatus(str, Enum):
+    """State of an install job running in the background."""
+
+    WAITING = "waiting"  # waiting to be dequeued
+    DOWNLOADING = "downloading"  # downloading of model files in process
+    DOWNLOADS_DONE = "downloads_done"  # downloading done, waiting to run
+    RUNNING = "running"  # being processed
+    PAUSED = "paused"  # paused, can be resumed
+    COMPLETED = "completed"  # finished running
+    ERROR = "error"  # terminated with an error message
+    CANCELLED = "cancelled"  # terminated with an error message
+
+
+class UnknownInstallJobException(Exception):
+    """Raised when the status of an unknown job is requested."""
+
+
+class StringLikeSource(BaseModel):
+    """
+    Base class for model sources, implements functions that lets the source be sorted and indexed.
+
+    These shenanigans let this stuff work:
+
+      source1 = LocalModelSource(path='C:/users/mort/foo.safetensors')
+      mydict = {source1: 'model 1'}
+      assert mydict['C:/users/mort/foo.safetensors'] == 'model 1'
+      assert mydict[LocalModelSource(path='C:/users/mort/foo.safetensors')] == 'model 1'
+
+      source2 = LocalModelSource(path=Path('C:/users/mort/foo.safetensors'))
+      assert source1 == source2
+      assert source1 == 'C:/users/mort/foo.safetensors'
+    """
+
+    def __hash__(self) -> int:
+        """Return hash of the path field, for indexing."""
+        return hash(str(self))
+
+    def __lt__(self, other: object) -> int:
+        """Return comparison of the stringified version, for sorting."""
+        return str(self) < str(other)
+
+    def __eq__(self, other: object) -> bool:
+        """Return equality on the stringified version."""
+        if isinstance(other, Path):
+            return str(self) == other.as_posix()
+        else:
+            return str(self) == str(other)
+
+
+class LocalModelSource(StringLikeSource):
+    """A local file or directory path."""
+
+    path: str | Path
+    inplace: Optional[bool] = False
+    type: Literal["local"] = "local"
+
+    # these methods allow the source to be used in a string-like way,
+    # for example as an index into a dict
+    def __str__(self) -> str:
+        """Return string version of path when string rep needed."""
+        return Path(self.path).as_posix()
+
+
+class HFModelSource(StringLikeSource):
+    """
+    A HuggingFace repo_id with optional variant, sub-folder(s) and access token.
+    Note that the variant option, if not provided to the constructor, will default to fp16, which is
+    what people (almost) always want.
+
+    The subfolder can be a single path or multiple paths joined by '+' (e.g., "text_encoder+tokenizer").
+    When multiple subfolders are specified, all of them will be downloaded and combined into the model directory.
+    """
+
+    repo_id: str
+    variant: Optional[ModelRepoVariant] = ModelRepoVariant.FP16
+    subfolder: Optional[Path] = None
+    access_token: Optional[str] = None
+    type: Literal["hf"] = "hf"
+
+    @field_validator("repo_id")
+    @classmethod
+    def proper_repo_id(cls, v: str) -> str:  # noqa D102
+        if not re.match(r"^([.\w-]+/[.\w-]+)$", v):
+            raise ValueError(f"{v}: invalid repo_id format")
+        return v
+
+    @property
+    def subfolders(self) -> list[Path]:
+        """Return list of subfolders (supports '+' separated multiple subfolders)."""
+        if self.subfolder is None:
+            return []
+        subfolder_str = self.subfolder.as_posix()
+        if "+" in subfolder_str:
+            return [Path(s.strip()) for s in subfolder_str.split("+")]
+        return [self.subfolder]
+
+    def __str__(self) -> str:
+        """Return string version of repoid when string rep needed."""
+        base: str = self.repo_id
+        if self.variant:
+            base += f":{self.variant or ''}"
+        if self.subfolder:
+            base += f"::{self.subfolder.as_posix()}"
+        return base
+
+
+class URLModelSource(StringLikeSource):
+    """A generic URL point to a checkpoint file."""
+
+    url: AnyHttpUrl
+    access_token: Optional[str] = None
+    type: Literal["url"] = "url"
+
+    def __str__(self) -> str:
+        """Return string version of the url when string rep needed."""
+        return str(self.url)
+
+
+class ExternalModelSource(StringLikeSource):
+    """An external provider model identifier."""
+
+    provider_id: str
+    provider_model_id: str
+    type: Literal["external"] = "external"
+
+    def __str__(self) -> str:
+        return f"external://{self.provider_id}/{self.provider_model_id}"
+
+
+ModelSource = Annotated[
+    Union[LocalModelSource, HFModelSource, URLModelSource, ExternalModelSource],
+    Field(discriminator="type"),
+]
+
+MODEL_SOURCE_TO_TYPE_MAP = {
+    URLModelSource: ModelSourceType.Url,
+    HFModelSource: ModelSourceType.HFRepoID,
+    LocalModelSource: ModelSourceType.Path,
+    ExternalModelSource: ModelSourceType.External,
+}
+
+
+class ModelInstallJob(BaseModel):
+    """Object that tracks the current status of an install request."""
+
+    id: int = Field(description="Unique ID for this job")
+    status: InstallStatus = Field(default=InstallStatus.WAITING, description="Current status of install process")
+    error_reason: Optional[str] = Field(default=None, description="Information about why the job failed")
+    config_in: ModelRecordChanges = Field(
+        default_factory=ModelRecordChanges,
+        description="Configuration information (e.g. 'description') to apply to model.",
+    )
+    config_out: Optional[AnyModelConfig] = Field(
+        default=None, description="After successful installation, this will hold the configuration object."
+    )
+    inplace: bool = Field(
+        default=False, description="Leave model in its current location; otherwise install under models directory"
+    )
+    source: ModelSource = Field(description="Source (URL, repo_id, or local path) of model")
+    local_path: Path = Field(description="Path to locally-downloaded model; may be the same as the source")
+    bytes: int = Field(
+        default=0, description="For a remote model, the number of bytes downloaded so far (may not be available)"
+    )
+    total_bytes: int = Field(default=0, description="Total size of the model to be installed")
+    source_metadata: Optional[AnyModelRepoMetadata] = Field(
+        default=None, description="Metadata provided by the model source"
+    )
+    download_parts: Set[DownloadJob] = Field(
+        default_factory=set, description="Download jobs contributing to this install"
+    )
+    error: Optional[str] = Field(
+        default=None, description="On an error condition, this field will contain the text of the exception"
+    )
+    error_traceback: Optional[str] = Field(
+        default=None, description="On an error condition, this field will contain the exception traceback"
+    )
+    # internal flags and transitory settings
+    _install_tmpdir: Optional[Path] = PrivateAttr(default=None)
+    _install_tmpdir_active_sentinel_created: bool = PrivateAttr(default=False)
+    _install_tmpdir_claim_conflict: bool = PrivateAttr(default=False)
+    _install_tmpdir_recovery_sentinel_created: bool = PrivateAttr(default=False)
+    _multifile_job: Optional[MultiFileDownloadJob] = PrivateAttr(default=None)
+    _exception: Optional[Exception] = PrivateAttr(default=None)
+    _resume_metadata: Optional[dict] = PrivateAttr(default=None)
+    _recovery_required: bool = PrivateAttr(default=False)
+    _cancel_requested: bool = PrivateAttr(default=False)
+    _install_phase: Optional[str] = PrivateAttr(default=None)
+    _source_protection_root: Optional[Path] = PrivateAttr(default=None)
+    _source_active_sentinel_created: bool = PrivateAttr(default=False)
+    _source_recovery_sentinel_created: bool = PrivateAttr(default=False)
+    _source_recovery_sentinel_preexisting: bool = PrivateAttr(default=False)
+
+    def set_error(self, e: Exception) -> None:
+        """Record the error and traceback from an exception."""
+        self._exception = e
+        self.error = str(e)
+        self.error_traceback = self._format_error(e)
+        self.status = InstallStatus.ERROR
+        self.error_reason = self._exception.__class__.__name__ if self._exception else None
+
+    def cancel(self) -> None:
+        """Call to cancel the job."""
+        self.status = InstallStatus.CANCELLED
+
+    @property
+    def error_type(self) -> Optional[str]:
+        """Class name of the exception that led to status==ERROR."""
+        return self._exception.__class__.__name__ if self._exception else None
+
+    def _format_error(self, exception: Exception) -> str:
+        """Error traceback."""
+        return "".join(traceback.format_exception(exception))
+
+    @property
+    def cancelled(self) -> bool:
+        """Set status to CANCELLED."""
+        return self.status == InstallStatus.CANCELLED
+
+    @property
+    def errored(self) -> bool:
+        """Return true if job has errored."""
+        return self.status == InstallStatus.ERROR
+
+    @property
+    def waiting(self) -> bool:
+        """Return true if job is waiting to run."""
+        return self.status == InstallStatus.WAITING
+
+    @property
+    def downloading(self) -> bool:
+        """Return true if job is downloading."""
+        return self.status == InstallStatus.DOWNLOADING
+
+    @property
+    def downloads_done(self) -> bool:
+        """Return true if job's downloads ae done."""
+        return self.status == InstallStatus.DOWNLOADS_DONE
+
+    @property
+    def paused(self) -> bool:
+        """Return true if job is paused."""
+        return self.status == InstallStatus.PAUSED
+
+    @property
+    def running(self) -> bool:
+        """Return true if job is running."""
+        return self.status == InstallStatus.RUNNING
+
+    @property
+    def complete(self) -> bool:
+        """Return true if job completed without errors."""
+        return self.status == InstallStatus.COMPLETED
+
+    @property
+    def in_terminal_state(self) -> bool:
+        """Return true if job is in a terminal state."""
+        return self.status in [InstallStatus.COMPLETED, InstallStatus.ERROR, InstallStatus.CANCELLED]

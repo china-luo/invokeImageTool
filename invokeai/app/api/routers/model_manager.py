@@ -1,0 +1,1829 @@
+"""FastAPI route for model configuration records."""
+
+import asyncio
+import contextlib
+import io
+import pathlib
+import shutil
+import threading
+import traceback
+import unicodedata
+from collections.abc import Generator
+from copy import deepcopy
+from enum import Enum
+from tempfile import mkdtemp
+from typing import Any, List, Optional, Type
+
+import huggingface_hub
+from fastapi import Body, Header, Path, Query, Request, Response, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.routing import APIRouter
+from PIL import Image
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
+from starlette.exceptions import HTTPException
+from typing_extensions import Annotated
+
+from invokeai.app.api.auth_dependencies import AdminUserOrDefault, CurrentUserOrDefault
+from invokeai.app.api.dependencies import ApiDependencies
+from invokeai.app.services.model_images.model_images_common import (
+    ModelImageFileDeleteException,
+    ModelImageFileNotFoundException,
+)
+from invokeai.app.services.model_install.model_install_common import (
+    InstallCancellationConflictError,
+    InstallDownloadConflictError,
+    InstallRecoveryRequiredError,
+    ModelInstallJob,
+)
+from invokeai.app.services.model_load.model_load_common import load_settings_changed
+from invokeai.app.services.model_records import (
+    InvalidModelException,
+    ModelRecordChanges,
+    ModelRecordOrderBy,
+    UnknownModelException,
+)
+from invokeai.app.services.orphaned_models import CONVERSION_SCRATCH_DIRNAME, OrphanedModelInfo
+from invokeai.app.services.shared.pagination import SQLiteDirection
+from invokeai.app.util.path_safety import is_plain_filename
+from invokeai.app.util.suppress_output import SuppressOutput
+from invokeai.backend.architectures import ArchitectureCapabilities, architecture_capabilities
+from invokeai.backend.model_manager.configs.external_api import ExternalApiModelConfig
+from invokeai.backend.model_manager.configs.factory import AnyModelConfig, ModelConfigFactory
+from invokeai.backend.model_manager.configs.main import (
+    Main_Checkpoint_SD1_Config,
+    Main_Checkpoint_SD2_Config,
+    Main_Checkpoint_SDXL_Config,
+    Main_Checkpoint_SDXLRefiner_Config,
+)
+from invokeai.backend.model_manager.load.fp8_capability import Fp8StorageSupport, fp8_storage_support
+from invokeai.backend.model_manager.load.model_cache.cache_stats import CacheStats
+from invokeai.backend.model_manager.load.model_cache.model_cache import MODEL_LOAD_LOCK
+from invokeai.backend.model_manager.metadata.fetch.huggingface import HuggingFaceMetadataFetch
+from invokeai.backend.model_manager.metadata.metadata_base import ModelMetadataWithFiles, UnknownMetadataException
+from invokeai.backend.model_manager.model_on_disk import ModelOnDisk
+from invokeai.backend.model_manager.search import ModelSearch, ModelSearchCancelled
+from invokeai.backend.model_manager.starter_models import (
+    STARTER_BUNDLES,
+    STARTER_MODELS,
+    StarterModel,
+    StarterModelBundle,
+    StarterModelWithoutDependencies,
+)
+from invokeai.backend.model_manager.taxonomy import BaseModelType, ModelFormat, ModelType
+
+model_manager_router = APIRouter(prefix="/v2/models", tags=["model_manager"])
+
+# Conversion loads a model, writes a diffusers copy, then swaps the record. As an `async def`
+# body with no `await` it could not overlap with another request; running in the threadpool it
+# can, and two conversions in flight means two models resident at once with nothing bounding the
+# RAM/VRAM that takes. Held non-blocking: an admin gets a 409 telling them to wait rather than
+# an HTTP request that hangs for the minutes a conversion takes.
+_MODEL_CONVERSION_LOCK = threading.Lock()
+
+# Bounding conversions against each other is not enough: deletion runs in the threadpool too, and
+# conversion is a read-modify-replace spanning many service calls. Interleaved on one key, a
+# delete removes the source a conversion is still reading, the conversion's own final
+# `installer.delete` then fails, and the converted copy it already installed survives - so the
+# admin is told 204 and the model reappears under a new key. Claiming the key makes operations on
+# one model serialize while leaving different models free to run in parallel.
+_MODEL_KEY_CLAIM_LOCK = threading.Lock()
+_CLAIMED_MODEL_KEYS: set[str] = set()
+
+
+def _claim_token(key: str) -> str:
+    """The form of a key recorded in `_CLAIMED_MODEL_KEYS`.
+
+    A model's cover image is stored as `<key>.webp`, and some filesystems map different strings to one file: the
+    macOS and Windows defaults are case-insensitive, and APFS also ignores Unicode normalization, so `\u00e9` and
+    `e\u0301` name the same entry. Claims use Unicode canonical caseless matching (NFD, casefold, NFD) so that such a
+    variant of a key cannot slip past a claim held on the key itself and touch that file. Two keys that are
+    distinct on disk but equal under this form would at worst serialize against each other.
+    """
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", key).casefold())
+
+
+@contextlib.contextmanager
+def _claim_model_key(key: str) -> Generator[None, None, None]:
+    """Hold the exclusive claim on one model key, or raise 409 if another request holds it."""
+    # The lock also guards the short install-and-register transition used by conversion. Do not
+    # block a worker thread behind that transition: reject the request and let the caller retry.
+    if not _MODEL_KEY_CLAIM_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Another model operation is already in progress. Wait for it to finish and try again.",
+        )
+    token = _claim_token(key)
+    try:
+        if token in _CLAIMED_MODEL_KEYS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Another operation on model {key} is already in progress. Wait for it to finish and try again.",
+            )
+        _CLAIMED_MODEL_KEYS.add(token)
+    finally:
+        _MODEL_KEY_CLAIM_LOCK.release()
+    try:
+        yield
+    finally:
+        with _MODEL_KEY_CLAIM_LOCK:
+            _CLAIMED_MODEL_KEYS.discard(token)
+
+
+@contextlib.contextmanager
+def _install_and_claim_model(
+    installer: Any, model_path: pathlib.Path, config: ModelRecordChanges
+) -> Generator[str, None, None]:
+    """Install a model and claim its key before another request can observe it."""
+    # install_path computes and registers the key internally. Serialize that registration with
+    # request claims so a delete cannot observe the new record before its key is claimed.
+    with _MODEL_KEY_CLAIM_LOCK:
+        new_key = installer.install_path(model_path, config=config)
+        token = _claim_token(new_key)
+        if token in _CLAIMED_MODEL_KEYS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Another operation on model {new_key} is already in progress. Wait for it to finish and try again.",
+            )
+        _CLAIMED_MODEL_KEYS.add(token)
+    try:
+        yield new_key
+    finally:
+        with _MODEL_KEY_CLAIM_LOCK:
+            _CLAIMED_MODEL_KEYS.discard(token)
+
+
+# The HF token is process-global state backed by a file in the HF cache. Concurrent writers would
+# interleave set/reset with the status read that follows it, so the reported status need not
+# describe the token that was just written.
+_HF_TOKEN_LOCK = threading.Lock()
+
+# images are immutable; set a high max-age
+IMAGE_MAX_AGE = 31536000
+
+
+class ModelsList(BaseModel):
+    """Return list of configs."""
+
+    models: List[AnyModelConfig]
+
+    model_config = ConfigDict(use_enum_values=True)
+
+
+class EmptyModelCacheResponse(BaseModel):
+    models_cleared: int
+    bytes_freed: int
+
+
+class CacheType(str, Enum):
+    """Cache type - one of vram or ram."""
+
+    RAM = "RAM"
+    VRAM = "VRAM"
+
+
+def add_cover_image_to_model_config(config: AnyModelConfig, dependencies: Type[ApiDependencies]) -> AnyModelConfig:
+    """Add a cover image URL to a model configuration."""
+    cover_image = dependencies.invoker.services.model_images.get_url(config.key)
+    return config.model_copy(update={"cover_image": cover_image})
+
+
+def apply_external_starter_model_overrides(config: AnyModelConfig) -> AnyModelConfig:
+    """Overlay starter-model metadata onto installed external model configs."""
+    if not isinstance(config, ExternalApiModelConfig):
+        return config
+
+    starter_match = next((starter for starter in STARTER_MODELS if starter.source == config.source), None)
+    if starter_match is None:
+        return config
+
+    model_updates: dict[str, object] = {}
+    if starter_match.capabilities is not None:
+        model_updates["capabilities"] = starter_match.capabilities
+    if starter_match.default_settings is not None:
+        model_updates["default_settings"] = starter_match.default_settings
+    if starter_match.panel_schema is not None:
+        model_updates["panel_schema"] = starter_match.panel_schema
+
+    if not model_updates:
+        return config
+
+    return config.model_copy(update=model_updates)
+
+
+def prepare_model_config_for_response(config: AnyModelConfig, dependencies: Type[ApiDependencies]) -> AnyModelConfig:
+    """Apply API-only model config overlays before returning a response."""
+    config = apply_external_starter_model_overrides(config)
+    return add_cover_image_to_model_config(config, dependencies)
+
+
+##############################################################################
+# These are example inputs and outputs that are used in places where Swagger
+# is unable to generate a correct example.
+##############################################################################
+example_model_config = {
+    "path": "string",
+    "name": "string",
+    "base": "sd-1",
+    "type": "main",
+    "format": "checkpoint",
+    "config_path": "string",
+    "key": "string",
+    "hash": "string",
+    "file_size": 1,
+    "description": "string",
+    "source": "string",
+    "converted_at": 0,
+    "variant": "normal",
+    "prediction_type": "epsilon",
+    "repo_variant": "fp16",
+    "upcast_attention": False,
+}
+
+example_model_input = {
+    "path": "/path/to/model",
+    "name": "model_name",
+    "base": "sd-1",
+    "type": "main",
+    "format": "checkpoint",
+    "config_path": "configs/stable-diffusion/v1-inference.yaml",
+    "description": "Model description",
+    "vae": None,
+    "variant": "normal",
+}
+
+##############################################################################
+# ROUTES
+##############################################################################
+
+
+@model_manager_router.get(
+    "/capabilities",
+    operation_id="list_architecture_capabilities",
+    responses={200: {"description": "What each model architecture supports"}},
+)
+def list_architecture_capabilities(current_user: CurrentUserOrDefault) -> list[ArchitectureCapabilities]:
+    """What each model architecture can generate, and which generation features it supports.
+
+    A static table, the same for every install and every user, derived from what the architectures
+    declare under `invokeai/backend/architectures/defs/`. Fetch it once and join it against model
+    records locally: look up `(base, variant)`, fall back to `(base, null)`.
+
+    Deliberately not a field on the model records themselves — it is the same for every model of an
+    architecture, and putting it there would add these fields to all 115 config schemas.
+
+    Authenticated like every other route here even though the response holds nothing user-specific:
+    the allowlist for public routes is short and deliberate, and this is not a reason to lengthen it.
+
+    Declared `def`, not `async def`: it awaits nothing, so FastAPI runs it in a threadpool instead of
+    on the event loop. See docs/contributing/blocking-work-in-api-routes.
+    """
+    return architecture_capabilities()
+
+
+@model_manager_router.get(
+    "/fp8_storage_support",
+    operation_id="list_fp8_storage_support",
+    responses={200: {"description": "Whether FP8 Storage does anything, per loader key"}},
+)
+def list_fp8_storage_support(current_user: CurrentUserOrDefault) -> list[Fp8StorageSupport]:
+    """Which kinds of model FP8 Storage actually reaches, so a client stops offering it for the rest.
+
+    Keyed `(base, type, format)` -- the key model loaders are registered under, because the answer
+    differs along all three: FLUX main implements the cast and FLUX ControlNet does not, and a GGUF
+    main model must never be re-encoded. A key with no row is not supported; that is also what the
+    server itself concludes for one.
+
+    A static table, the same for every install and every user. Fetch it once and join it against model
+    records locally. Whether the *device* can do fp8 is deliberately not in here -- that probe belongs
+    on the loading thread, not behind an HTTP handler.
+
+    Declared `def`, not `async def`: it awaits nothing, so FastAPI runs it in a threadpool instead of
+    on the event loop. See docs/contributing/blocking-work-in-api-routes.
+    """
+    return fp8_storage_support()
+
+
+@model_manager_router.get(
+    "/",
+    operation_id="list_model_records",
+)
+def list_model_records(
+    current_user: CurrentUserOrDefault,
+    base_models: Optional[List[BaseModelType]] = Query(default=None, description="Base models to include"),
+    model_type: Optional[ModelType] = Query(default=None, description="The type of model to get"),
+    model_name: Optional[str] = Query(default=None, description="Exact match on the name of the model"),
+    model_format: Optional[ModelFormat] = Query(
+        default=None, description="Exact match on the format of the model (e.g. 'diffusers')"
+    ),
+    order_by: ModelRecordOrderBy = Query(default=ModelRecordOrderBy.Name, description="The field to order by"),
+    direction: SQLiteDirection = Query(default=SQLiteDirection.Ascending, description="The direction to order by"),
+) -> ModelsList:
+    """Get a list of models."""
+    record_store = ApiDependencies.invoker.services.model_manager.store
+    found_models: list[AnyModelConfig] = []
+    if base_models:
+        for base_model in base_models:
+            found_models.extend(
+                record_store.search_by_attr(
+                    base_model=base_model,
+                    model_type=model_type,
+                    model_name=model_name,
+                    model_format=model_format,
+                    order_by=order_by,
+                    direction=direction,
+                )
+            )
+    else:
+        found_models.extend(
+            record_store.search_by_attr(
+                model_type=model_type,
+                model_name=model_name,
+                model_format=model_format,
+                order_by=order_by,
+                direction=direction,
+            )
+        )
+    for index, model in enumerate(found_models):
+        found_models[index] = prepare_model_config_for_response(model, ApiDependencies)
+    return ModelsList(models=found_models)
+
+
+@model_manager_router.get(
+    "/missing",
+    operation_id="list_missing_models",
+    responses={200: {"description": "List of models with missing files"}},
+)
+def list_missing_models(current_user: CurrentUserOrDefault) -> ModelsList:
+    """Get models whose files are missing from disk.
+
+    These are models that have database entries but their corresponding
+    weight files have been deleted externally (not via Model Manager).
+
+    Available to any authenticated user, not just admins: the frontend's model hooks subtract this
+    set from the model list so unusable models are kept out of the generation dropdowns.
+    """
+    record_store = ApiDependencies.invoker.services.model_manager.store
+    models_path = ApiDependencies.invoker.services.configuration.models_path
+
+    missing_models: list[AnyModelConfig] = []
+    for model_config in record_store.all_models():
+        if model_config.base == BaseModelType.External or model_config.format == ModelFormat.ExternalApi:
+            continue
+        if not (models_path / model_config.path).resolve().exists():
+            missing_models.append(model_config)
+
+    return ModelsList(models=missing_models)
+
+
+@model_manager_router.get(
+    "/models_dir",
+    operation_id="get_models_dir",
+    responses={200: {"description": "The absolute path of the models directory"}},
+)
+def get_models_dir(current_user: CurrentUserOrDefault) -> str:
+    """Get the absolute path of the directory managed models are stored in.
+
+    Model config `path` values are relative to this directory unless they are
+    absolute (in-place installs from outside it).
+    """
+    return ApiDependencies.invoker.services.configuration.models_path.resolve().as_posix()
+
+
+@model_manager_router.get(
+    "/get_by_attrs",
+    operation_id="get_model_records_by_attrs",
+    response_model=AnyModelConfig,
+)
+def get_model_records_by_attrs(
+    current_user: CurrentUserOrDefault,
+    name: str = Query(description="The name of the model"),
+    type: ModelType = Query(description="The type of the model"),
+    base: BaseModelType = Query(description="The base model of the model"),
+) -> AnyModelConfig:
+    """Gets a model by its attributes. The main use of this route is to provide backwards compatibility with the old
+    model manager, which identified models by a combination of name, base and type."""
+    configs = ApiDependencies.invoker.services.model_manager.store.search_by_attr(
+        base_model=base, model_type=type, model_name=name
+    )
+    if not configs:
+        raise HTTPException(status_code=404, detail="No model found with these attributes")
+
+    return prepare_model_config_for_response(configs[0], ApiDependencies)
+
+
+@model_manager_router.get(
+    "/get_by_hash",
+    operation_id="get_model_records_by_hash",
+    response_model=AnyModelConfig,
+)
+def get_model_records_by_hash(
+    current_user: CurrentUserOrDefault,
+    hash: str = Query(description="The hash of the model"),
+) -> AnyModelConfig:
+    """Gets a model by its hash. This is useful for recalling models that were deleted and reinstalled,
+    as the hash remains stable across reinstallations while the key (UUID) changes."""
+    configs = ApiDependencies.invoker.services.model_manager.store.search_by_hash(hash)
+    if not configs:
+        raise HTTPException(status_code=404, detail="No model found with this hash")
+
+    return prepare_model_config_for_response(configs[0], ApiDependencies)
+
+
+@model_manager_router.get(
+    "/i/{key}",
+    operation_id="get_model_record",
+    responses={
+        200: {
+            "description": "The model configuration was retrieved successfully",
+            "content": {"application/json": {"example": example_model_config}},
+        },
+        400: {"description": "Bad request"},
+        404: {"description": "The model could not be found"},
+    },
+)
+def get_model_record(
+    current_user: CurrentUserOrDefault,
+    key: str = Path(description="Key of the model record to fetch."),
+) -> AnyModelConfig:
+    """Get a model record"""
+    try:
+        config = ApiDependencies.invoker.services.model_manager.store.get_model(key)
+        return prepare_model_config_for_response(config, ApiDependencies)
+    except UnknownModelException as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@model_manager_router.post(
+    "/i/{key}/reidentify",
+    operation_id="reidentify_model",
+    responses={
+        200: {
+            "description": "The model configuration was retrieved successfully",
+            "content": {"application/json": {"example": example_model_config}},
+        },
+        400: {"description": "Bad request"},
+        404: {"description": "The model could not be found"},
+        409: {"description": "Another operation on this model is already in progress"},
+    },
+)
+def reidentify_model(
+    key: Annotated[str, Path(description="Key of the model to reidentify.")],
+    current_admin: AdminUserOrDefault,
+) -> AnyModelConfig:
+    """Attempt to reidentify a model by re-probing its weights file."""
+    try:
+        with _claim_model_key(key):
+            return _reidentify_model(key)
+    except UnknownModelException as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidModelException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _reidentify_model(key: str) -> AnyModelConfig:
+    """Re-probe one model and rewrite its record. Callers must hold the key claim."""
+    config = ApiDependencies.invoker.services.model_manager.store.get_model(key)
+    models_path = ApiDependencies.invoker.services.configuration.models_path
+    if pathlib.Path(config.path).is_relative_to(models_path):
+        model_path = pathlib.Path(config.path)
+    else:
+        model_path = models_path / config.path
+    mod = ModelOnDisk(model_path)
+    # The install source is evidence identification reads: for a model whose weights cannot name its
+    # backbone (a 16-channel VAE, a PiD decoder), the HF repo or URL may. A file copied into the models
+    # folder has also lost the folder it came from, so without the source a re-probe refiles it under
+    # the default.
+    override_fields = {"source": config.source, "source_type": config.source_type}
+    if encoder_id := getattr(config, "image_encoder_model_id", None):
+        override_fields["image_encoder_model_id"] = encoder_id
+    result = ModelConfigFactory.from_model_on_disk(mod, override_fields)
+    if result.config is None:
+        raise InvalidModelException("Unable to identify model format")
+
+    # Retain user-editable fields from the original config
+    result.config.path = config.path
+    result.config.key = config.key
+    result.config.name = config.name
+    result.config.description = config.description
+    result.config.cover_image = config.cover_image
+    if hasattr(result.config, "trigger_phrases") and hasattr(config, "trigger_phrases"):
+        result.config.trigger_phrases = config.trigger_phrases
+    result.config.source = config.source
+    result.config.source_type = config.source_type
+    if hasattr(config, "cpu_only") and hasattr(result.config, "cpu_only"):
+        result.config.cpu_only = config.cpu_only
+    previous_settings = getattr(config, "default_settings", None)
+    updated_settings = getattr(result.config, "default_settings", None)
+    if previous_settings is not None and updated_settings is not None:
+        updated_settings = deepcopy(updated_settings)
+        result.config.default_settings = updated_settings
+        for field in ("cpu_only", "fp8_storage"):
+            if hasattr(previous_settings, field) and hasattr(updated_settings, field):
+                setattr(updated_settings, field, getattr(previous_settings, field))
+
+    # The probe can reset load-affecting settings (cpu_only, default_settings), so in-flight loads must re-check.
+    with ApiDependencies.invoker.services.model_manager.load.record_edit(config.key) as edit:
+        updated = ApiDependencies.invoker.services.model_manager.store.replace_model(config.key, result.config)
+        edit.load_affecting = _invalidate_model_load_caches(config.key, config, updated)
+    return updated
+
+
+class FoundModel(BaseModel):
+    path: str = Field(description="Path to the model")
+    is_installed: bool = Field(description="Whether or not the model is already installed")
+
+
+@model_manager_router.get(
+    "/scan_folder",
+    operation_id="scan_for_models",
+    responses={
+        200: {"description": "Directory scanned successfully"},
+        400: {"description": "Invalid directory path"},
+    },
+    status_code=200,
+    response_model=List[FoundModel],
+)
+async def scan_for_models(
+    request: Request,
+    current_admin: AdminUserOrDefault,
+    scan_path: str = Query(description="Directory path to search for models", default=None),
+) -> List[FoundModel]:
+    # A single generic error is used for every path-validation failure below, so that the response cannot be
+    # used as an existence/readability oracle for arbitrary filesystem paths.
+    scan_failed = HTTPException(
+        status_code=400,
+        detail=f"The search path '{scan_path}' could not be scanned",
+    )
+
+    # Guard before constructing a Path: the query param defaults to None and pathlib.Path(None) raises.
+    if not scan_path:
+        raise scan_failed
+
+    path = pathlib.Path(scan_path)
+    if not path.is_dir():
+        raise scan_failed
+
+    # The walk runs off the event loop and is polled against the request: a client that cancels the scan
+    # (or navigates away) disconnects, and the walk stops at the next directory instead of crawling on.
+    stop = threading.Event()
+    try:
+        search = ModelSearch(should_stop=stop.is_set)
+        walk = asyncio.ensure_future(asyncio.to_thread(search.search, path))
+        # A cancelled handler never awaits the walk; retrieving its outcome keeps asyncio from logging it at GC.
+        walk.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+        try:
+            while not walk.done():
+                if await request.is_disconnected():
+                    break
+                await asyncio.wait({walk}, timeout=0.25)
+        finally:
+            # Covers the disconnect branch and a cancelled handler alike: the thread must not keep crawling.
+            stop.set()
+        try:
+            found_model_paths = await walk
+        except ModelSearchCancelled:
+            return []
+
+        def classify_found_models() -> list[FoundModel]:
+            models_path = ApiDependencies.invoker.services.configuration.models_path
+
+            # If the search path includes the main models directory, we need to exclude core models from the list.
+            # TODO(MM2): Core models should be handled by the model manager so we can determine if they are installed
+            # without needing to crawl the filesystem.
+            core_models_path = pathlib.Path(models_path, "core").resolve()
+            non_core_model_paths = [p for p in found_model_paths if not p.is_relative_to(core_models_path)]
+
+            installed_models = ApiDependencies.invoker.services.model_manager.store.search_by_attr()
+            installed_paths = {str(models_path / m.path) for m in installed_models}
+
+            # Check if the model is installed by comparing paths.
+            return [FoundModel(path=str(p), is_installed=str(p) in installed_paths) for p in non_core_model_paths]
+
+        # The store query and the path comparison are blocking work; this handler is async only to watch the request.
+        scan_results = await asyncio.to_thread(classify_found_models)
+    except Exception as e:
+        ApiDependencies.invoker.services.logger.error(
+            f"Error scanning '{scan_path}' for models: {type(e).__name__}: {e}"
+        )
+        # By this point is_dir() has already confirmed the path exists, so a distinct status leaks nothing
+        # new. Keeping 500 (with the details only in the server log) preserves the caller-error vs
+        # server-fault distinction for the admin and for retry logic.
+        raise HTTPException(status_code=500, detail=f"An error occurred while scanning '{scan_path}'")
+    return scan_results
+
+
+class HuggingFaceModels(BaseModel):
+    urls: List[AnyHttpUrl] | None = Field(description="URLs for all checkpoint format models in the metadata")
+    is_diffusers: bool = Field(description="Whether the metadata is for a Diffusers format model")
+
+
+@model_manager_router.get(
+    "/hugging_face",
+    operation_id="get_hugging_face_models",
+    responses={
+        200: {"description": "Hugging Face repo scanned successfully"},
+        400: {"description": "Invalid hugging face repo"},
+    },
+    status_code=200,
+    response_model=HuggingFaceModels,
+)
+def get_hugging_face_models(
+    current_admin: AdminUserOrDefault,
+    hugging_face_repo: str = Query(description="Hugging face repo to search for models", default=None),
+) -> HuggingFaceModels:
+    try:
+        metadata = HuggingFaceMetadataFetch().from_id(hugging_face_repo)
+    except UnknownMetadataException:
+        raise HTTPException(
+            status_code=400,
+            detail="No HuggingFace repository found",
+        )
+
+    assert isinstance(metadata, ModelMetadataWithFiles)
+
+    return HuggingFaceModels(
+        urls=metadata.ckpt_urls,
+        is_diffusers=metadata.is_diffusers,
+    )
+
+
+def _update_model_record(key: str, changes: ModelRecordChanges) -> AnyModelConfig:
+    """Update a model record and invalidate any cache affected by the change.
+
+    Keep the complete claim and synchronous service work in one worker-thread operation. This
+    route needs to await cache invalidation, but that must not leave the database read/write and
+    response preparation on the event loop before and after that await.
+    """
+    logger = ApiDependencies.invoker.services.logger
+    record_store = ApiDependencies.invoker.services.model_manager.store
+
+    # Claimed for the whole update: a conversion running on this key carries a snapshot of the
+    # record taken before it started and writes it into the replacement, so an edit accepted
+    # meanwhile would be reported as saved and then silently dropped.
+    with _claim_model_key(key), ApiDependencies.invoker.services.model_manager.load.record_edit(key) as edit:
+        try:
+            previous_config = record_store.get_model(key)
+            config = record_store.update_model(key, changes=changes, allow_class_change=True)
+            # Settings that change how the model loads (e.g. fp8_storage, cpu_only) are baked into the cached
+            # nn.Module at load time, so toggling them on a cached model is otherwise silently a no-op until
+            # the entry is evicted. Drop any unlocked cached entries for this model so the next load rebuilds.
+            edit.load_affecting = _invalidate_model_load_caches(key, previous_config, config)
+            config = prepare_model_config_for_response(config, ApiDependencies)
+            logger.info(f"Updated model: {key}")
+        except UnknownModelException as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            logger.error(str(e))
+            raise HTTPException(status_code=409, detail=str(e))
+    return config
+
+
+@model_manager_router.patch(
+    "/i/{key}",
+    operation_id="update_model_record",
+    responses={
+        200: {
+            "description": "The model was updated successfully",
+            "content": {"application/json": {"example": example_model_config}},
+        },
+        400: {"description": "Bad request"},
+        404: {"description": "The model could not be found"},
+        409: {"description": "There is already a model corresponding to the new name"},
+    },
+    status_code=200,
+)
+async def update_model_record(
+    key: Annotated[str, Path(description="Unique key of model")],
+    changes: Annotated[ModelRecordChanges, Body(description="Model config", examples=[example_model_input])],
+    current_admin: AdminUserOrDefault,
+) -> AnyModelConfig:
+    """Update a model's config."""
+    # The key identifies the row; it is not an editable field, and there is no UI to change one. The edit form
+    # does post the record back whole, so an unchanged echo is expected and accepted - but a *different* key is
+    # written into the stored config while the row id keeps the old one, which leaves a record that answers to a
+    # key nothing can look it up by: `replace_model` (and so reidentify) raises `UnknownModelException` forever
+    # after, and the UI caches the model under the new key so every later request for it 404s.
+    if "key" in changes.model_fields_set and changes.key != key:
+        raise HTTPException(status_code=422, detail="A model's key cannot be changed")
+    return await asyncio.to_thread(_update_model_record, key, changes)
+
+
+def _invalidate_model_load_caches(key: str, previous: AnyModelConfig, updated: AnyModelConfig) -> bool:
+    """Drop cached instances when a record change affects how the model is loaded; return whether it did."""
+    if not load_settings_changed(previous, updated):
+        return False
+    services = ApiDependencies.invoker.services
+    # Prevent a concurrent load from re-registering state built from the previous model identity.
+    with MODEL_LOAD_LOCK.write_lock():
+        dropped = sum(cache.drop_model(key) for cache in services.model_manager.load.ram_caches.values())
+    if dropped:
+        services.logger.info(
+            f"Dropped {dropped} cached entr{'y' if dropped == 1 else 'ies'} for model {key} after settings change."
+        )
+    return True
+
+
+@model_manager_router.get(
+    "/i/{key}/image",
+    operation_id="get_model_image",
+    responses={
+        200: {
+            "description": "The model image was fetched successfully",
+        },
+        400: {"description": "Bad request"},
+        404: {"description": "The model image could not be found"},
+    },
+    status_code=200,
+)
+def get_model_image(
+    key: str = Path(description="The name of model image file to get"),
+) -> FileResponse:
+    """Gets an image file that previews the model"""
+
+    try:
+        path = ApiDependencies.invoker.services.model_images.get_path(key)
+
+        response = FileResponse(
+            path,
+            media_type="image/png",
+            filename=key + ".png",
+            content_disposition_type="inline",
+        )
+        response.headers["Cache-Control"] = f"max-age={IMAGE_MAX_AGE}"
+        return response
+    except Exception:
+        raise HTTPException(status_code=404)
+
+
+@model_manager_router.patch(
+    "/i/{key}/image",
+    operation_id="update_model_image",
+    responses={
+        200: {
+            "description": "The model image was updated successfully",
+        },
+        400: {"description": "Bad request"},
+        404: {"description": "The model could not be found"},
+        409: {"description": "Another operation on this model is already in progress"},
+    },
+    status_code=200,
+)
+async def update_model_image(
+    key: Annotated[str, Path(description="Unique key of model")],
+    image: UploadFile,
+    current_admin: AdminUserOrDefault,
+) -> None:
+    if not image.content_type or not image.content_type.startswith("image"):
+        raise HTTPException(status_code=415, detail="Not an image")
+
+    logger = ApiDependencies.invoker.services.logger
+    model_images = ApiDependencies.invoker.services.model_images
+    # A conversion moves this model's image to the replacement's key when it finishes, so claim
+    # the key before reading the upload and hold it until the image is saved.
+    with _claim_model_key(key):
+        # The image is stored in a file named after the key, so a key that names no model would have us write a
+        # stray file - and a key that is not a plain filename would have us write it outside the images folder.
+        # Resolving the record turns both into a 404 instead. It has to happen under the claim: the delete and
+        # convert routes claim the key too, so they cannot remove the record between this check and the save.
+        # (Removing an external provider's models in `app_info.py` does not take the claim, so that path can
+        # still leave an orphan image - which the image-delete route below can clean up.)
+        try:
+            ApiDependencies.invoker.services.model_manager.store.get_model(key)
+        except UnknownModelException as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        # A record written before install requests had their keys validated can still carry a key that is not a
+        # plain filename. The storage service refuses to build a path from it; ask it now, so that is a 404
+        # rather than a save failure surfacing as a 500 after the upload has been read.
+        try:
+            model_images.get_path(key)
+        except ModelImageFileNotFoundException as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        contents = await image.read()
+        try:
+            pil_image = await asyncio.to_thread(Image.open, io.BytesIO(contents))
+
+        except Exception:
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=415, detail="Failed to read image")
+
+        try:
+            await asyncio.to_thread(model_images.save, pil_image, key)
+            logger.info(f"Updated image for model: {key}")
+        except ValueError as e:
+            logger.error(str(e))
+            raise HTTPException(status_code=409, detail=str(e))
+    return
+
+
+@model_manager_router.delete(
+    "/i/{key}",
+    operation_id="delete_model",
+    responses={
+        204: {"description": "Model deleted successfully"},
+        404: {"description": "Model not found"},
+        409: {"description": "Another operation on this model is already in progress"},
+    },
+    status_code=204,
+)
+def delete_model(
+    current_admin: AdminUserOrDefault,
+    key: str = Path(description="Unique key of model to remove from model registry."),
+) -> Response:
+    """
+    Delete model record from database.
+
+    The configuration record will be removed. The corresponding weights files will be
+    deleted as well if they reside within the InvokeAI "models" directory.
+    """
+    logger = ApiDependencies.invoker.services.logger
+
+    with _claim_model_key(key):
+        try:
+            installer = ApiDependencies.invoker.services.model_manager.install
+            installer.delete(key)
+            logger.info(f"Deleted model: {key}")
+            return Response(status_code=204)
+        except UnknownModelException as e:
+            logger.error(str(e))
+            raise HTTPException(status_code=404, detail=str(e))
+
+
+class BulkDeleteModelsRequest(BaseModel):
+    """Request body for bulk model deletion."""
+
+    keys: List[str] = Field(description="List of model keys to delete")
+
+
+class BulkDeleteModelsResponse(BaseModel):
+    """Response body for bulk model deletion."""
+
+    deleted: List[str] = Field(description="List of successfully deleted model keys")
+    failed: List[dict] = Field(description="List of failed deletions with error messages")
+
+
+class BulkReidentifyModelsRequest(BaseModel):
+    """Request body for bulk model reidentification."""
+
+    keys: List[str] = Field(description="List of model keys to reidentify")
+
+
+class BulkReidentifyModelsResponse(BaseModel):
+    """Response body for bulk model reidentification."""
+
+    succeeded: List[str] = Field(description="List of successfully reidentified model keys")
+    failed: List[dict] = Field(description="List of failed reidentifications with error messages")
+
+
+@model_manager_router.post(
+    "/i/bulk_delete",
+    operation_id="bulk_delete_models",
+    responses={
+        200: {"description": "Models deleted (possibly with some failures)"},
+    },
+    status_code=200,
+)
+def bulk_delete_models(
+    current_admin: AdminUserOrDefault,
+    request: BulkDeleteModelsRequest = Body(description="List of model keys to delete"),
+) -> BulkDeleteModelsResponse:
+    """
+    Delete multiple model records from database.
+
+    The configuration records will be removed. The corresponding weights files will be
+    deleted as well if they reside within the InvokeAI "models" directory.
+    Returns a list of successfully deleted keys and failed deletions with error messages.
+    """
+    logger = ApiDependencies.invoker.services.logger
+    installer = ApiDependencies.invoker.services.model_manager.install
+
+    deleted = []
+    failed = []
+
+    for key in request.keys:
+        try:
+            # Per key, so one model busy elsewhere is reported as a failure for that key rather
+            # than aborting the whole request or racing the operation that holds it.
+            with _claim_model_key(key):
+                installer.delete(key)
+            deleted.append(key)
+            logger.info(f"Deleted model: {key}")
+        except HTTPException as e:
+            logger.error(f"Failed to delete model {key}: {e.detail}")
+            failed.append({"key": key, "error": e.detail})
+        except UnknownModelException as e:
+            logger.error(f"Failed to delete model {key}: {str(e)}")
+            failed.append({"key": key, "error": str(e)})
+        except Exception as e:
+            logger.error(f"Failed to delete model {key}: {str(e)}")
+            failed.append({"key": key, "error": str(e)})
+
+    logger.info(f"Bulk delete completed: {len(deleted)} deleted, {len(failed)} failed")
+    return BulkDeleteModelsResponse(deleted=deleted, failed=failed)
+
+
+@model_manager_router.post(
+    "/i/bulk_reidentify",
+    operation_id="bulk_reidentify_models",
+    responses={
+        200: {"description": "Models reidentified (possibly with some failures)"},
+    },
+    status_code=200,
+)
+def bulk_reidentify_models(
+    current_admin: AdminUserOrDefault,
+    request: BulkReidentifyModelsRequest = Body(description="List of model keys to reidentify"),
+) -> BulkReidentifyModelsResponse:
+    """
+    Reidentify multiple models by re-probing their weights files.
+
+    Returns a list of successfully reidentified keys and failed reidentifications with error messages.
+    """
+    logger = ApiDependencies.invoker.services.logger
+
+    succeeded = []
+    failed = []
+
+    for key in request.keys:
+        try:
+            # Same claim and the same implementation as the single-model route: this loop used to
+            # carry its own copy of the retain-these-fields logic, which is one edit away from the
+            # two disagreeing about what a reidentification preserves.
+            with _claim_model_key(key):
+                _reidentify_model(key)
+            succeeded.append(key)
+            logger.info(f"Reidentified model: {key}")
+        except HTTPException as e:
+            logger.error(f"Failed to reidentify model {key}: {e.detail}")
+            failed.append({"key": key, "error": e.detail})
+        except UnknownModelException as e:
+            logger.error(f"Failed to reidentify model {key}: {str(e)}")
+            failed.append({"key": key, "error": str(e)})
+        except Exception as e:
+            logger.error(f"Failed to reidentify model {key}: {str(e)}")
+            failed.append({"key": key, "error": str(e)})
+
+    logger.info(f"Bulk reidentify completed: {len(succeeded)} succeeded, {len(failed)} failed")
+    return BulkReidentifyModelsResponse(succeeded=succeeded, failed=failed)
+
+
+@model_manager_router.delete(
+    "/i/{key}/image",
+    operation_id="delete_model_image",
+    responses={
+        204: {"description": "Model image deleted successfully"},
+        404: {"description": "Model image not found"},
+        409: {"description": "Another operation on this model is already in progress"},
+    },
+    status_code=204,
+)
+def delete_model_image(
+    current_admin: AdminUserOrDefault,
+    key: str = Path(description="Unique key of model image to remove from model_images directory."),
+) -> None:
+    logger = ApiDependencies.invoker.services.logger
+    model_images = ApiDependencies.invoker.services.model_images
+    # Claimed for the same reason as the upload: a conversion carries this model's image over to
+    # the replacement's key, so a delete accepted meanwhile is undone by that copy.
+    with _claim_model_key(key):
+        # Unlike the upload, this does not require the model's record: deleting a model leaves its image
+        # behind, and this route is how that orphan gets cleaned up. The storage service rejects a key that
+        # is not a plain filename, and that - like a missing file - is a 404.
+        try:
+            model_images.delete(key)
+            logger.info(f"Deleted model image: {key}")
+            return
+        except ModelImageFileDeleteException as e:
+            if isinstance(e.__cause__, ModelImageFileNotFoundException):
+                raise HTTPException(status_code=404, detail=str(e.__cause__))
+            raise
+
+
+@model_manager_router.post(
+    "/install",
+    operation_id="install_model",
+    responses={
+        201: {"description": "The model imported successfully"},
+        415: {"description": "Unrecognized file/folder format"},
+        424: {"description": "The model appeared to import successfully, but could not be found in the model manager"},
+        409: {"description": "There is already a model corresponding to this path or repo_id"},
+    },
+    status_code=201,
+)
+def install_model(
+    current_admin: AdminUserOrDefault,
+    source: str = Query(description="Model source to install, can be a local path, repo_id, or remote URL"),
+    inplace: Optional[bool] = Query(description="Whether or not to install a local model in place", default=False),
+    access_token: Optional[str] = Query(description="access token for the remote resource", default=None),
+    source_access_token: Optional[str] = Header(
+        alias="X-Model-Source-Access-Token",
+        description="access token for the remote resource",
+        default=None,
+    ),
+    config: ModelRecordChanges = Body(
+        description="Object containing fields that override auto-probed values in the model config record, such as name, description and prediction_type ",
+        examples=[{"name": "string", "description": "string"}],
+    ),
+) -> ModelInstallJob:
+    """Install a model using a string identifier.
+
+    `source` can be any of the following.
+
+    1. A path on the local filesystem ('C:\\users\\fred\\model.safetensors')
+    2. A Url pointing to a single downloadable model file
+    3. A HuggingFace repo_id with any of the following formats:
+       - model/name
+       - model/name:fp16:vae
+       - model/name::vae          -- use default precision
+       - model/name:fp16:path/to/model.safetensors
+       - model/name::path/to/model.safetensors
+
+    `config` is a ModelRecordChanges object. Fields in this object will override
+    the ones that are probed automatically. Pass an empty object to accept
+    all the defaults.
+
+    `access_token` is an optional access token for use with Urls that require
+    authentication.
+
+    Models will be downloaded, probed, configured and installed in a
+    series of background threads. The return object has `status` attribute
+    that can be used to monitor progress.
+
+    See the documentation for `import_model_record` for more information on
+    interpreting the job information returned by this route.
+    """
+    logger = ApiDependencies.invoker.services.logger
+
+    # A caller may name the key it wants, and the key names the directory the model is moved into and the file its
+    # cover image is written to. Reject an unusable one here, where it is being chosen, rather than letting the
+    # install fail later at one of those joins. Existing records are not held to this - see `ModelRecordChanges.key`.
+    if config.key is not None and not is_plain_filename(config.key):
+        raise HTTPException(status_code=422, detail=f"Invalid model key {config.key!r}: it must be a plain filename")
+
+    try:
+        installer = ApiDependencies.invoker.services.model_manager.install
+        result: ModelInstallJob = installer.heuristic_import(
+            source=source,
+            config=config,
+            access_token=source_access_token or access_token,
+            inplace=bool(inplace),
+        )
+        logger.info(f"Started installation of {source}")
+    except UnknownModelException as e:
+        logger.error(str(e))
+        raise HTTPException(status_code=424, detail=str(e))
+    except InvalidModelException as e:
+        logger.error(str(e))
+        raise HTTPException(status_code=415)
+    except ValueError as e:
+        logger.error(str(e))
+        raise HTTPException(status_code=409, detail=str(e))
+    return result
+
+
+@model_manager_router.get(
+    "/install/huggingface",
+    operation_id="install_hugging_face_model",
+    responses={
+        201: {"description": "The model is being installed"},
+        400: {"description": "Bad request"},
+        409: {"description": "There is already a model corresponding to this path or repo_id"},
+    },
+    status_code=201,
+    response_class=HTMLResponse,
+)
+def install_hugging_face_model(
+    current_admin: AdminUserOrDefault,
+    source: str = Query(description="HuggingFace repo_id to install"),
+) -> HTMLResponse:
+    """Install a Hugging Face model using a string identifier."""
+
+    def generate_html(title: str, heading: str, repo_id: str, is_error: bool, message: str | None = "") -> str:
+        if message:
+            message = f"<p>{message}</p>"
+        title_class = "error" if is_error else "success"
+        return f"""
+            <html>
+
+            <head>
+                <title>{title}</title>
+                <style>
+                    body {{
+                        text-align: center;
+                        background-color: hsl(220 12% 10% / 1);
+                        font-family: Helvetica, sans-serif;
+                        color: hsl(220 12% 86% / 1);
+                    }}
+
+                    .repo-id {{
+                        color: hsl(220 12% 68% / 1);
+                    }}
+
+                    .error {{
+                        color: hsl(0 42% 68% / 1)
+                    }}
+
+                    .message-box {{
+                        display: inline-block;
+                        border-radius: 5px;
+                        background-color: hsl(220 12% 20% / 1);
+                        padding-inline-end: 30px;
+                        padding: 20px;
+                        padding-inline-start: 30px;
+                        padding-inline-end: 30px;
+                    }}
+
+                    .container {{
+                        display: flex;
+                        width: 100%;
+                        height: 100%;
+                        align-items: center;
+                        justify-content: center;
+                    }}
+
+                    a {{
+                        color: inherit
+                    }}
+
+                    a:visited {{
+                        color: inherit
+                    }}
+
+                    a:active {{
+                        color: inherit
+                    }}
+                </style>
+            </head>
+
+            <body style="background-color: hsl(220 12% 10% / 1);">
+                <div class="container">
+                    <div class="message-box">
+                        <h2 class="{title_class}">{heading}</h2>
+                        {message}
+                        <p class="repo-id">Repo ID: {repo_id}</p>
+                    </div>
+                </div>
+            </body>
+
+            </html>
+        """
+
+    try:
+        metadata = HuggingFaceMetadataFetch().from_id(source)
+        assert isinstance(metadata, ModelMetadataWithFiles)
+    except UnknownMetadataException:
+        title = "Unable to Install Model"
+        heading = "No HuggingFace repository found with that repo ID."
+        message = "Ensure the repo ID is correct and try again."
+        return HTMLResponse(content=generate_html(title, heading, source, True, message), status_code=400)
+
+    logger = ApiDependencies.invoker.services.logger
+
+    try:
+        installer = ApiDependencies.invoker.services.model_manager.install
+        if metadata.is_diffusers:
+            installer.heuristic_import(
+                source=source,
+                inplace=False,
+            )
+        elif metadata.ckpt_urls is not None and len(metadata.ckpt_urls) == 1:
+            installer.heuristic_import(
+                source=str(metadata.ckpt_urls[0]),
+                inplace=False,
+            )
+        else:
+            title = "Unable to Install Model"
+            heading = "This HuggingFace repo has multiple models."
+            message = "Please use the Model Manager to install this model."
+            return HTMLResponse(content=generate_html(title, heading, source, True, message), status_code=200)
+
+        title = "Model Install Started"
+        heading = "Your HuggingFace model is installing now."
+        message = "You can close this tab and check the Model Manager for installation progress."
+        return HTMLResponse(content=generate_html(title, heading, source, False, message), status_code=201)
+    except Exception as e:
+        logger.error(str(e))
+        title = "Unable to Install Model"
+        heading = "There was an problem installing this model."
+        message = 'Please use the Model Manager directly to install this model. If the issue persists, ask for help on <a href="https://discord.gg/ZmtBAhwWhy">discord</a>.'
+        return HTMLResponse(content=generate_html(title, heading, source, True, message), status_code=500)
+
+
+@model_manager_router.get(
+    "/install",
+    operation_id="list_model_installs",
+)
+def list_model_installs(current_admin: AdminUserOrDefault) -> List[ModelInstallJob]:
+    """Return the list of model install jobs.
+
+    Install jobs have a numeric `id`, a `status`, and other fields that provide information on
+    the nature of the job and its progress. The `status` is one of:
+
+    * "waiting" -- Job is waiting in the queue to run
+    * "downloading" -- Model file(s) are downloading
+    * "running" -- Model has downloaded and the model probing and registration process is running
+    * "paused" -- Job is paused and can be resumed
+    * "completed" -- Installation completed successfully
+    * "error" -- An error occurred. Details will be in the "error_type" and "error" fields.
+    * "cancelled" -- Job was cancelled before completion.
+
+    Once completed, information about the model such as its size, base
+    model and type can be retrieved from the `config_out` field. For multi-file models such as diffusers,
+    information on individual files can be retrieved from `download_parts`.
+
+    See the example and schema below for more information.
+    """
+    jobs: List[ModelInstallJob] = ApiDependencies.invoker.services.model_manager.install.list_jobs()
+    return jobs
+
+
+@model_manager_router.get(
+    "/install/{id}",
+    operation_id="get_model_install_job",
+    responses={
+        200: {"description": "Success"},
+        404: {"description": "No such job"},
+    },
+)
+def get_model_install_job(
+    current_admin: AdminUserOrDefault, id: int = Path(description="Model install id")
+) -> ModelInstallJob:
+    """
+    Return model install job corresponding to the given source. See the documentation for 'List Model Install Jobs'
+    for information on the format of the return value.
+    """
+    try:
+        result: ModelInstallJob = ApiDependencies.invoker.services.model_manager.install.get_job_by_id(id)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@model_manager_router.delete(
+    "/install/{id}",
+    operation_id="cancel_model_install_job",
+    responses={
+        201: {"description": "The job was cancelled successfully"},
+        415: {"description": "No such job"},
+        409: {"description": "The job cannot be cancelled safely in its current state"},
+    },
+    status_code=201,
+)
+def cancel_model_install_job(
+    current_admin: AdminUserOrDefault,
+    id: int = Path(description="Model install job ID"),
+) -> None:
+    """Cancel the model install job(s) corresponding to the given job ID."""
+    installer = ApiDependencies.invoker.services.model_manager.install
+    try:
+        job = installer.get_job_by_id(id)
+    except ValueError as e:
+        raise HTTPException(status_code=415, detail=str(e))
+    try:
+        installer.cancel_job(job)
+    except (InstallCancellationConflictError, InstallDownloadConflictError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
+@model_manager_router.post(
+    "/install/{id}/pause",
+    operation_id="pause_model_install_job",
+    responses={
+        201: {"description": "The job was paused successfully"},
+        409: {"description": "The job cannot be paused in its current state"},
+        415: {"description": "No such job"},
+    },
+    status_code=201,
+)
+def pause_model_install_job(
+    current_admin: AdminUserOrDefault, id: int = Path(description="Model install job ID")
+) -> ModelInstallJob:
+    """Pause the model install job corresponding to the given job ID."""
+    installer = ApiDependencies.invoker.services.model_manager.install
+    try:
+        job = installer.get_job_by_id(id)
+    except ValueError as e:
+        raise HTTPException(status_code=415, detail=str(e))
+    try:
+        installer.pause_job(job)
+    except (InstallCancellationConflictError, InstallDownloadConflictError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return job
+
+
+@model_manager_router.post(
+    "/install/{id}/resume",
+    operation_id="resume_model_install_job",
+    responses={
+        201: {"description": "The job was resumed successfully"},
+        409: {"description": "A previous download still owns the staging directory"},
+        415: {"description": "No such job"},
+    },
+    status_code=201,
+)
+def resume_model_install_job(
+    current_admin: AdminUserOrDefault, id: int = Path(description="Model install job ID")
+) -> ModelInstallJob:
+    """Resume a paused model install job corresponding to the given job ID."""
+    installer = ApiDependencies.invoker.services.model_manager.install
+    try:
+        job = installer.get_job_by_id(id)
+    except ValueError as e:
+        raise HTTPException(status_code=415, detail=str(e))
+    try:
+        installer.resume_job(job)
+    except (InstallCancellationConflictError, InstallDownloadConflictError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return job
+
+
+@model_manager_router.post(
+    "/install/{id}/restart_failed",
+    operation_id="restart_failed_model_install_job",
+    responses={
+        201: {"description": "Failed files restarted successfully"},
+        409: {"description": "A prior download is active or recovery data must be preserved"},
+        415: {"description": "No such job"},
+    },
+    status_code=201,
+)
+def restart_failed_model_install_job(
+    current_admin: AdminUserOrDefault, id: int = Path(description="Model install job ID")
+) -> ModelInstallJob:
+    """Restart failed or non-resumable file downloads for the given job."""
+    installer = ApiDependencies.invoker.services.model_manager.install
+    try:
+        job = installer.get_job_by_id(id)
+    except ValueError as e:
+        raise HTTPException(status_code=415, detail=str(e))
+    try:
+        installer.restart_failed(job)
+    except (InstallCancellationConflictError, InstallDownloadConflictError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return job
+
+
+@model_manager_router.post(
+    "/install/{id}/restart_file",
+    operation_id="restart_model_install_file",
+    responses={
+        201: {"description": "File restarted successfully"},
+        409: {"description": "A prior download is active or recovery data must be preserved"},
+        415: {"description": "No such job"},
+    },
+    status_code=201,
+)
+def restart_model_install_file(
+    current_admin: AdminUserOrDefault,
+    id: int = Path(description="Model install job ID"),
+    file_source: AnyHttpUrl = Body(description="File download URL to restart"),
+) -> ModelInstallJob:
+    """Restart a specific file download for the given job."""
+    installer = ApiDependencies.invoker.services.model_manager.install
+    try:
+        job = installer.get_job_by_id(id)
+    except ValueError as e:
+        raise HTTPException(status_code=415, detail=str(e))
+    try:
+        installer.restart_file(job, str(file_source))
+    except (InstallCancellationConflictError, InstallDownloadConflictError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return job
+
+
+@model_manager_router.delete(
+    "/install",
+    operation_id="prune_model_install_jobs",
+    responses={
+        204: {"description": "All completed and errored jobs have been pruned"},
+        400: {"description": "Bad request"},
+    },
+)
+def prune_model_install_jobs(current_admin: AdminUserOrDefault) -> Response:
+    """Prune all completed and errored jobs from the install job list."""
+    ApiDependencies.invoker.services.model_manager.install.prune_jobs()
+    return Response(status_code=204)
+
+
+@model_manager_router.put(
+    "/convert/{key}",
+    operation_id="convert_model",
+    responses={
+        200: {
+            "description": "Model converted successfully",
+            "content": {"application/json": {"example": example_model_config}},
+        },
+        400: {"description": "Bad request"},
+        404: {"description": "Model not found"},
+        409: {"description": "There is already a model registered at this location"},
+    },
+)
+def convert_model(
+    current_admin: AdminUserOrDefault,
+    key: str = Path(description="Unique key of the safetensors main model to convert to diffusers format."),
+) -> AnyModelConfig:
+    """
+    Permanently convert a model into diffusers format, replacing the safetensors version.
+    Note that during the conversion process the key and model hash will change.
+    The return value is the model configuration for the converted model.
+    """
+    if not _MODEL_CONVERSION_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Another model conversion is already in progress. Wait for it to finish and try again.",
+        )
+    try:
+        # Claimed for the whole conversion, so a delete arriving mid-way is refused rather than
+        # pulling the source out from under it. Deletion never takes the conversion lock, so the
+        # two are ordered consistently and cannot deadlock.
+        with _claim_model_key(key):
+            return _convert_model(key, user_id=current_admin.user_id)
+    finally:
+        _MODEL_CONVERSION_LOCK.release()
+
+
+def _convert_model(key: str, user_id: str) -> AnyModelConfig:
+    """Converts one model. Callers must hold `_MODEL_CONVERSION_LOCK`."""
+    model_manager = ApiDependencies.invoker.services.model_manager
+    loader = model_manager.load
+    logger = ApiDependencies.invoker.services.logger
+    store = ApiDependencies.invoker.services.model_manager.store
+    installer = ApiDependencies.invoker.services.model_manager.install
+
+    try:
+        model_config = store.get_model(key)
+    except UnknownModelException as e:
+        logger.error(str(e))
+        raise HTTPException(status_code=424, detail=str(e))
+
+    if not isinstance(
+        model_config,
+        (
+            Main_Checkpoint_SD1_Config,
+            Main_Checkpoint_SD2_Config,
+            Main_Checkpoint_SDXL_Config,
+            Main_Checkpoint_SDXLRefiner_Config,
+        ),
+    ):
+        msg = f"The model with key {key} is not a main SD 1/2/XL checkpoint model."
+        logger.error(msg)
+        raise HTTPException(400, msg)
+
+    # Under the models root so `install_path` below moves the result rather than copying it across
+    # a filesystem boundary, but inside the scratch directory the orphan scan skips: a half-written
+    # diffusers copy is model files with no database record, which is exactly what that scan hunts
+    # for, and `DELETE /sync/orphaned` would rmtree it while it is still being written.
+    scratch_dir = ApiDependencies.invoker.services.configuration.models_path / CONVERSION_SCRATCH_DIRNAME
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    tmpdir = pathlib.Path(mkdtemp(dir=scratch_dir))
+    preserve_scratch = False
+    try:
+        convert_path = tmpdir / pathlib.Path(model_config.path).stem
+        converted_model = loader.load_model(model_config, user_id=user_id)
+        # write the converted file to the convert path
+        raw_model = converted_model.model
+        assert hasattr(raw_model, "save_pretrained")
+        raw_model.save_pretrained(convert_path)  # type: ignore
+        assert convert_path.exists()
+
+        # temporarily rename the original safetensors file so that there is no naming conflict
+        original_name = model_config.name
+        model_config.name = f"{original_name}.DELETE"
+        changes = ModelRecordChanges(name=model_config.name)
+        store.update_model(key, changes=changes)
+
+        # Install and claim the diffusers before allowing another request to observe its key.
+        with contextlib.ExitStack() as conversion_stack:
+            try:
+                new_key = conversion_stack.enter_context(
+                    _install_and_claim_model(
+                        installer,
+                        convert_path,
+                        config=ModelRecordChanges(
+                            name=original_name,
+                            description=model_config.description,
+                            hash=model_config.hash,
+                            source=model_config.source,
+                        ),
+                    )
+                )
+            except InstallRecoveryRequiredError as e:
+                preserve_scratch = True
+                logger.error(str(e))
+                store.update_model(key, changes=ModelRecordChanges(name=original_name))
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{e} Conversion recovery source retained at {tmpdir.resolve()}.",
+                ) from e
+            except Exception as e:
+                logger.error(str(e))
+                store.update_model(key, changes=ModelRecordChanges(name=original_name))
+                raise HTTPException(status_code=409, detail=str(e))
+
+            # Update the model image if the model had one.
+            try:
+                model_image = ApiDependencies.invoker.services.model_images.get(key)
+                ApiDependencies.invoker.services.model_images.save(model_image, new_key)
+                ApiDependencies.invoker.services.model_images.delete(key)
+            except ModelImageFileNotFoundException:
+                pass
+
+            # Delete the original safetensors file.
+            installer.delete(key)
+
+            # Return the config record for the new diffusers directory.
+            new_config = store.get_model(new_key)
+            new_config = prepare_model_config_for_response(new_config, ApiDependencies)
+            return new_config
+    finally:
+        if not preserve_scratch:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class StarterModelResponse(BaseModel):
+    starter_models: list[StarterModel]
+    starter_bundles: dict[str, StarterModelBundle]
+
+
+def get_is_installed(
+    starter_model: StarterModel | StarterModelWithoutDependencies, installed_models: list[AnyModelConfig]
+) -> bool:
+    from invokeai.backend.model_manager.taxonomy import ModelType
+
+    for model in installed_models:
+        # Check if source matches exactly
+        if model.source == starter_model.source:
+            return True
+        # Check if name (or previous names), base and type match
+        if (
+            (model.name == starter_model.name or model.name in starter_model.previous_names)
+            and model.base == starter_model.base
+            and model.type == starter_model.type
+        ):
+            return True
+
+    # Special handling for Qwen3Encoder models - check by type and variant
+    # This allows renamed models to still be detected as installed
+    if starter_model.type == ModelType.Qwen3Encoder:
+        from invokeai.backend.model_manager.taxonomy import Qwen3VariantType
+
+        # Determine expected variant from source pattern
+        expected_variant: Qwen3VariantType | None = None
+        source = starter_model.source.lower()
+        if "klein-9B" in starter_model.source or "qwen3_8b" in source or "qwen_3_8b" in source:
+            expected_variant = Qwen3VariantType.Qwen3_8B
+        elif (
+            "klein-4B" in starter_model.source
+            or "qwen3_4b" in source
+            or "qwen_3_4b" in source
+            or "Z-Image" in starter_model.source
+        ):
+            expected_variant = Qwen3VariantType.Qwen3_4B
+
+        if expected_variant is not None:
+            for model in installed_models:
+                if model.type == ModelType.Qwen3Encoder and hasattr(model, "variant"):
+                    model_variant = model.variant
+                    # Handle both enum and string values
+                    if isinstance(model_variant, Qwen3VariantType):
+                        if model_variant == expected_variant:
+                            return True
+                    elif isinstance(model_variant, str):
+                        if model_variant == expected_variant.value:
+                            return True
+
+    return False
+
+
+@model_manager_router.get("/starter_models", operation_id="get_starter_models", response_model=StarterModelResponse)
+def get_starter_models(current_admin: AdminUserOrDefault) -> StarterModelResponse:
+    installed_models = ApiDependencies.invoker.services.model_manager.store.search_by_attr()
+    starter_models = deepcopy(STARTER_MODELS)
+    starter_bundles = deepcopy(STARTER_BUNDLES)
+    for model in starter_models:
+        model.is_installed = get_is_installed(model, installed_models)
+        # Remove already-installed dependencies
+        missing_deps: list[StarterModelWithoutDependencies] = []
+
+        for dep in model.dependencies or []:
+            if not get_is_installed(dep, installed_models):
+                missing_deps.append(dep)
+        model.dependencies = missing_deps
+
+    for bundle in starter_bundles.values():
+        for model in bundle.models:
+            model.is_installed = get_is_installed(model, installed_models)
+            # Remove already-installed dependencies
+            missing_deps: list[StarterModelWithoutDependencies] = []
+            for dep in model.dependencies or []:
+                if not get_is_installed(dep, installed_models):
+                    missing_deps.append(dep)
+            model.dependencies = missing_deps
+
+    return StarterModelResponse(starter_models=starter_models, starter_bundles=starter_bundles)
+
+
+@model_manager_router.get(
+    "/stats",
+    operation_id="get_stats",
+    response_model=Optional[CacheStats],
+    summary="Get model manager RAM cache performance statistics.",
+)
+def get_stats(current_admin: AdminUserOrDefault) -> Optional[CacheStats]:
+    """Return performance statistics on the model manager's RAM cache. In multi-GPU mode there is
+    one cache per generation device; their statistics are aggregated. Will return null if no models
+    have been loaded."""
+    stats_list: list[CacheStats] = []
+    seen_cache_ids: set[int] = set()
+    # ram_caches can map several device keys to the same cache object; count each cache once.
+    for cache in ApiDependencies.invoker.services.model_manager.load.ram_caches.values():
+        if id(cache) in seen_cache_ids:
+            continue
+        seen_cache_ids.add(id(cache))
+        if cache.stats is not None:
+            stats_list.append(cache.stats)
+
+    if not stats_list:
+        return None
+    if len(stats_list) == 1:
+        return stats_list[0]
+
+    aggregate = CacheStats()
+    for stats in stats_list:
+        # Per-cache event counters: sum across caches.
+        aggregate.hits += stats.hits
+        aggregate.misses += stats.misses
+        aggregate.in_cache += stats.in_cache
+        aggregate.cleared += stats.cleared
+        # cache_size, high_watermark and cache_used are already system-wide values: every per-device
+        # cache shares one global RamBudget, so each reports the same global capacity and observes
+        # the same global usage. Summing them would over-report an N-GPU system ~N times; take the
+        # max. cache_used must be carried through explicitly — it is this fork's field for *current*
+        # usage, and the Queue widget's gauge silently falls back to high_watermark (peak) when it
+        # is absent, which reads as a cache that never releases memory.
+        aggregate.high_watermark = max(aggregate.high_watermark, stats.high_watermark)
+        aggregate.cache_size = max(aggregate.cache_size, stats.cache_size)
+        aggregate.cache_used = max(aggregate.cache_used, stats.cache_used)
+        aggregate.loaded_model_sizes.update(stats.loaded_model_sizes)
+    return aggregate
+
+
+@model_manager_router.post(
+    "/empty_model_cache",
+    operation_id="empty_model_cache",
+    status_code=200,
+    response_model=EmptyModelCacheResponse,
+)
+def empty_model_cache(current_admin: AdminUserOrDefault) -> EmptyModelCacheResponse:
+    """Drop all models from the model cache to free RAM/VRAM. 'Locked' models that are in active use will not be dropped."""
+    # Request 1000GB of room in order to force each per-device cache to drop all models.
+    ApiDependencies.invoker.services.logger.info("Emptying model cache.")
+    models_cleared = 0
+    bytes_freed = 0
+    seen_cache_ids: set[int] = set()
+    # ram_caches can map several device keys to the same cache object; clearing one twice would
+    # report the second (empty) pass and double-count nothing, but the id() guard keeps the totals
+    # honest and matches get_stats above.
+    for cache in ApiDependencies.invoker.services.model_manager.load.ram_caches.values():
+        if id(cache) in seen_cache_ids:
+            continue
+        seen_cache_ids.add(id(cache))
+        result = cache.make_room(1000 * 2**30)
+        models_cleared += result.models_cleared
+        bytes_freed += result.bytes_freed
+    return EmptyModelCacheResponse(models_cleared=models_cleared, bytes_freed=bytes_freed)
+
+
+class HFTokenStatus(str, Enum):
+    VALID = "valid"
+    INVALID = "invalid"
+    UNKNOWN = "unknown"
+
+
+class HFTokenHelper:
+    @classmethod
+    def get_status(cls) -> HFTokenStatus:
+        try:
+            token = huggingface_hub.get_token()
+            if not token:
+                return HFTokenStatus.INVALID
+            huggingface_hub.whoami(token=token)
+            return HFTokenStatus.VALID
+        except Exception:
+            return HFTokenStatus.UNKNOWN
+
+    @classmethod
+    def set_token(cls, token: str) -> HFTokenStatus:
+        with SuppressOutput(), contextlib.suppress(Exception):
+            huggingface_hub.login(token=token, add_to_git_credential=False)
+        return cls.get_status()
+
+    @classmethod
+    def reset_token(cls) -> HFTokenStatus:
+        with SuppressOutput(), contextlib.suppress(Exception):
+            huggingface_hub.logout()
+        return cls.get_status()
+
+
+@model_manager_router.get("/hf_login", operation_id="get_hf_login_status", response_model=HFTokenStatus)
+def get_hf_login_status(current_admin: AdminUserOrDefault) -> HFTokenStatus:
+    token_status = HFTokenHelper.get_status()
+
+    if token_status is HFTokenStatus.UNKNOWN:
+        ApiDependencies.invoker.services.logger.warning("Unable to verify HF token")
+
+    return token_status
+
+
+@model_manager_router.post("/hf_login", operation_id="do_hf_login", response_model=HFTokenStatus)
+def do_hf_login(
+    current_admin: AdminUserOrDefault,
+    token: str = Body(description="Hugging Face token to use for login", embed=True),
+) -> HFTokenStatus:
+    # Write and read-back as one step; see _HF_TOKEN_LOCK.
+    with _HF_TOKEN_LOCK:
+        HFTokenHelper.set_token(token)
+        token_status = HFTokenHelper.get_status()
+
+    if token_status is HFTokenStatus.UNKNOWN:
+        ApiDependencies.invoker.services.logger.warning("Unable to verify HF token")
+
+    return token_status
+
+
+@model_manager_router.delete("/hf_login", operation_id="reset_hf_token", response_model=HFTokenStatus)
+def reset_hf_token(current_admin: AdminUserOrDefault) -> HFTokenStatus:
+    with _HF_TOKEN_LOCK:
+        return HFTokenHelper.reset_token()
+
+
+# Orphaned Models Management Routes
+
+
+class DeleteOrphanedModelsRequest(BaseModel):
+    """Request to delete specific orphaned model directories."""
+
+    paths: list[str] = Field(description="List of relative paths to delete")
+
+
+class DeleteOrphanedModelsResponse(BaseModel):
+    """Response from deleting orphaned models."""
+
+    deleted: list[str] = Field(description="Paths that were successfully deleted")
+    errors: dict[str, str] = Field(description="Paths that had errors, with error messages")
+
+
+@model_manager_router.get(
+    "/sync/orphaned",
+    operation_id="get_orphaned_models",
+    response_model=list[OrphanedModelInfo],
+)
+def get_orphaned_models(_: AdminUserOrDefault) -> list[OrphanedModelInfo]:
+    """Find orphaned model directories.
+
+    Orphaned models are directories in the models folder that contain model files
+    but are not referenced in the database. This can happen when models are deleted
+    from the database but the files remain on disk.
+
+    Returns:
+        List of orphaned model directory information
+    """
+    from invokeai.app.services.orphaned_models import OrphanedModelsService
+
+    service = OrphanedModelsService(
+        config=ApiDependencies.invoker.services.configuration,
+        store=ApiDependencies.invoker.services.model_manager.store,
+    )
+    return service.find_orphaned_models()
+
+
+@model_manager_router.delete(
+    "/sync/orphaned",
+    operation_id="delete_orphaned_models",
+    response_model=DeleteOrphanedModelsResponse,
+)
+def delete_orphaned_models(request: DeleteOrphanedModelsRequest, _: AdminUserOrDefault) -> DeleteOrphanedModelsResponse:
+    """Delete specified orphaned model directories.
+
+    Args:
+        request: Request containing list of relative paths to delete
+
+    Returns:
+        Response indicating which paths were deleted and which had errors
+    """
+    from invokeai.app.services.orphaned_models import OrphanedModelsService
+
+    service = OrphanedModelsService(
+        config=ApiDependencies.invoker.services.configuration,
+        store=ApiDependencies.invoker.services.model_manager.store,
+    )
+
+    results = service.delete_orphaned_models(request.paths)
+
+    # Separate successful deletions from errors
+    deleted = [path for path, status in results.items() if status == "deleted"]
+    errors = {path: status for path, status in results.items() if status != "deleted"}
+
+    return DeleteOrphanedModelsResponse(deleted=deleted, errors=errors)

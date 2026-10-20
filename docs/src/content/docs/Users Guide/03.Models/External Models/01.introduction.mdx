@@ -1,0 +1,86 @@
+---
+title: Using external models
+---
+
+External models let you generate images in Invoke by calling third-party image generation APIs instead of running a model locally. This is useful when:
+
+- You don't have the GPU or VRAM to run a model locally.
+- You want access to closed-source models (e.g. GPT Image, Gemini).
+- You need a specific provider capability (very high resolutions, fast batches, bilingual text rendering, etc.).
+
+External models appear in the model picker alongside locally installed models. Generations are routed to the provider's API, billed against your provider account, and the resulting images are imported back into Invoke like any other generation.
+
+## Supported Providers
+
+- [Google Gemini](/users-guide/models/external-models/gemini/) — Gemini 2.5 Flash Image, Gemini 3 Pro Image Preview, Gemini 3.1 Flash Image Preview
+- [OpenAI](/users-guide/models/external-models/openai/) — GPT Image 1 / 1.5 / 1-mini, DALL·E 3
+- [BytePlus Seedream](/users-guide/models/external-models/seedream/) — Seedream 5.0, 5.0 Lite, 4.5, 4.0
+- [Alibaba Cloud DashScope](/users-guide/models/external-models/alibabacloud/) — Qwen Image 2.0 / 2.0 Pro / Max / Edit Max, Wan 2.6 T2I
+
+## Configuring API Keys
+
+External provider credentials are stored in a dedicated `api_keys.yaml` file alongside `invokeai.yaml` in your Invoke root directory.
+
+```yaml
+# api_keys.yaml
+external_gemini_api_key: "your-gemini-api-key"
+external_openai_api_key: "your-openai-api-key"
+
+# Optional: override the provider base URL (e.g. for a compatible proxy or regional endpoint)
+external_gemini_base_url: "https://generativelanguage.googleapis.com"
+external_openai_base_url: "https://api.openai.com"
+```
+
+Restart Invoke after editing `api_keys.yaml` so the new values are picked up.
+
+!!! warning "Keep your keys private"
+    `api_keys.yaml` contains secrets. Do not commit it to version control and do not share it with other users of your machine.
+
+## Custom Image APIs
+
+To use an image API relay or a model that is not in the starter list, open **Model Manager → API Keys → Custom Image API**.
+
+1. Enter the service's **Base URL** and **API Key**. Use the API root, such as `https://images.example.com`, or a versioned root ending in `/v1` or `/v1beta`.
+2. Add the exact **Model ID** accepted by the service, a **Display Name** for the model picker, and the model's **Protocol**. You can configure up to 50 models sharing this URL and key.
+3. Save the configuration. The models become available in the model picker immediately, without downloading weights or restarting Invoke.
+
+Choose the protocol supported by the service for each model:
+
+| Protocol                      | Example Model ID         | Image generation API                                                                                                                                 |
+| ----------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **OpenAI Images** (`openai`)  | `grok-imagine-image-2.0` | `/v1/images/generations`; responses contain base64 image data or image URLs.                                                                         |
+| **Grok / xAI Images** (`xai`) | `grok-imagine-image-2.0` | `/v1/images/generations`; sends `aspect_ratio` instead of `size`, without a `resolution` parameter.                                                  |
+| **Gemini native** (`gemini`)  | `gemini-3.1-flash-image` | `/v1beta/models/{model}:generateContent`; requests use `x-goog-api-key` and text/image response modalities, and images are returned as `inlineData`. |
+
+These IDs illustrate protocol selection; the service must provide access to the exact model ID you enter. A model appearing in the service's catalog does not guarantee that the current API key and endpoint can generate images with it. Existing custom models without a protocol setting continue to use OpenAI Images, including existing Grok configurations. Select **Grok / xAI Images** explicitly when the service expects xAI's request format; this does not guarantee that a service-side request error will be resolved.
+
+Grok / xAI Images maps the requested dimensions to the closest of the 13 aspect ratios supported by the xAI SDK. Gemini native also maps the requested dimensions to a supported aspect ratio. For both protocols, the upstream service determines the final pixel dimensions.
+
+Invoke uses `/v1` for OpenAI Images and Grok / xAI Images, and `/v1beta` for Gemini native. It adds the version to an unversioned Base URL or replaces a trailing `/v1` or `/v1beta` with the selected protocol's version, preserving any earlier path prefix. Do not enter the full generation endpoint as the Base URL.
+
+The shared API key must be enabled for every configured model and protocol. Some services assign keys to a provider-specific group; a key enabled only for OpenAI-compatible models may not have access to Grok / xAI Images or Gemini native models. Use a key and service group that support the protocols you select.
+
+Models added through this form expose text-to-image generation only. The adapters' editing support does not automatically enable editing for a custom model. Chat endpoints such as `/chat/completions` and other provider-specific protocols are not supported by this configuration.
+
+Clearing this configuration removes its custom model entries from Invoke. It does not delete locally installed models or generated images.
+
+## Installing External Models
+
+External models are listed in the starter models dialog under their provider. Install them like any other starter model — Invoke records a model reference but does not download weights (there are no weights to download).
+
+Once installed, external models show up everywhere a model can be selected. Choose one, set the usual parameters (prompt, dimensions, num images, etc.), and invoke as normal.
+
+## Capabilities and Settings Visibility
+
+Each external model declares its own **capabilities** — for example:
+
+- Which generation modes it supports (`txt2img`, `img2img`). Inpainting is not currently supported by any external provider.
+- Whether it accepts reference images, and how many.
+- Which aspect ratios and resolutions it allows.
+- Whether it supports a negative prompt, seed, or batch size > 1.
+
+Invoke uses these capabilities to drive the UI: only the settings a given model actually supports will be shown in the parameters panel. If a field you expect is missing, it's because the selected model does not support it.
+
+## Costs and Rate Limits
+
+External providers charge for each request. Check the provider's pricing page before running large batches. Rate-limit errors from the provider are surfaced in Invoke as generation failures — wait a moment and try again, or lower your concurrent batch size.

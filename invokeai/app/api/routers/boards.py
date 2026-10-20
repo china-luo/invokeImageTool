@@ -1,0 +1,325 @@
+from typing import Optional, Union
+
+from fastapi import Body, HTTPException, Path, Query
+from fastapi.routing import APIRouter
+from pydantic import BaseModel, Field
+
+from invokeai.app.api.auth_dependencies import CurrentUserOrDefault
+from invokeai.app.api.dependencies import ApiDependencies
+from invokeai.app.api.routers._access import assert_board_changes as _assert_board_changes
+from invokeai.app.api.routers._access import assert_board_read_access as _assert_board_read_access
+from invokeai.app.api.routers.image_move_maintenance import assert_image_move_maintenance_inactive
+from invokeai.app.services.board_access.board_access_common import (
+    BoardAction,
+    BoardViewer,
+)
+from invokeai.app.services.board_records.board_records_common import (
+    BoardChanges,
+    BoardRecordInboxException,
+    BoardRecordNotFoundException,
+    BoardRecordOrderBy,
+    BoardRecordProjectNotFoundException,
+)
+from invokeai.app.services.boards.boards_common import BoardDTO
+from invokeai.app.services.image_records.image_records_common import ImageCategory
+from invokeai.app.services.shared.pagination import MAX_PAGE_SIZE, OffsetPaginatedResults, SQLiteDirection
+
+boards_router = APIRouter(prefix="/v1/boards", tags=["boards"])
+
+
+class DeleteBoardResult(BaseModel):
+    board_id: str = Field(description="The id of the board that was deleted.")
+    deleted_board_images: list[str] = Field(
+        description="The image names of the board-images relationships that were deleted."
+    )
+    deleted_images: list[str] = Field(description="The names of the images that were deleted.")
+    deleted_board_videos: list[str] = Field(
+        default_factory=list,
+        description="The video names of the board-videos relationships that were deleted.",
+    )
+    deleted_videos: list[str] = Field(
+        default_factory=list,
+        description="The names of the videos that were deleted.",
+    )
+    failed_images: list[str] = Field(
+        default_factory=list,
+        description="The names of images that could not be deleted and became uncategorized.",
+    )
+    failed_videos: list[str] = Field(
+        default_factory=list,
+        description="The names of videos that could not be deleted and became uncategorized.",
+    )
+
+
+@boards_router.post(
+    "/",
+    operation_id="create_board",
+    responses={
+        201: {"description": "The board was created successfully"},
+    },
+    status_code=201,
+    response_model=BoardDTO,
+)
+def create_board(
+    current_user: CurrentUserOrDefault,
+    board_name: str = Query(description="The name of the board to create", max_length=300),
+    project_id: Optional[str] = Query(
+        default=None,
+        description="One of the current user's projects to create the board in; omit for the Library",
+    ),
+) -> BoardDTO:
+    """Creates a board for the current user, in one of their projects or in the Library"""
+    try:
+        return ApiDependencies.invoker.services.boards.create(
+            board_name=board_name, user_id=current_user.user_id, project_id=project_id, viewer=_viewer(current_user)
+        )
+    except BoardRecordProjectNotFoundException:
+        raise HTTPException(status_code=404, detail="Project not found")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to create board")
+
+
+@boards_router.get("/{board_id}", operation_id="get_board", response_model=BoardDTO)
+def get_board(
+    current_user: CurrentUserOrDefault,
+    board_id: str = Path(description="The id of board to get"),
+) -> BoardDTO:
+    """Gets a board (user must have access to it)"""
+
+    _assert_board_read_access(board_id, current_user)
+
+    # Only a board that is not there is a 404: clients take it as the board being gone and clear what names it. One
+    # the caller cannot open answered 403 above, a refusal its owner can reverse.
+    try:
+        return ApiDependencies.invoker.services.boards.get_dto(board_id=board_id, viewer=_viewer(current_user))
+    except BoardRecordNotFoundException:
+        raise HTTPException(status_code=404, detail="Board not found")
+
+
+def _viewer(current_user: CurrentUserOrDefault) -> BoardViewer:
+    return BoardViewer(user_id=current_user.user_id, is_admin=current_user.is_admin)
+
+
+def _actions_for(changes: BoardChanges) -> list[BoardAction]:
+    """The board actions a change takes, one per field it sets."""
+    actions: list[BoardAction] = []
+    if changes.board_name is not None:
+        actions.append(BoardAction.Rename)
+    if changes.cover_image_name is not None:
+        actions.append(BoardAction.SetCover)
+    if changes.archived is not None:
+        actions.append(BoardAction.Archive)
+    if changes.general_access is not None:
+        actions.append(BoardAction.SetGeneralAccess)
+    if changes.moves_board:
+        actions.append(BoardAction.Move)
+    # An update that names no field still writes the board: it takes an editor, as any change does.
+    return actions or [BoardAction.Rename]
+
+
+@boards_router.patch(
+    "/{board_id}",
+    operation_id="update_board",
+    responses={
+        201: {
+            "description": "The board was updated successfully",
+        },
+    },
+    status_code=201,
+    response_model=BoardDTO,
+)
+def update_board(
+    current_user: CurrentUserOrDefault,
+    board_id: str = Path(description="The id of board to update"),
+    changes: BoardChanges = Body(description="The changes to apply to the board"),
+) -> BoardDTO:
+    """Updates a board. Each field takes its own board action: renaming, setting the cover and archiving need an
+    editor; general access and moving between the Library and a project need the owner.
+
+    A project's inbox takes its name, archived state and general access from the project and cannot be moved,
+    so those changes are refused for it — for admins too; its cover is still fair game. The storage decides
+    that in one transaction.
+    """
+    _assert_board_changes(board_id, current_user, _actions_for(changes))
+
+    try:
+        return ApiDependencies.invoker.services.boards.update(
+            board_id=board_id, changes=changes, viewer=_viewer(current_user)
+        )
+    except BoardRecordInboxException:
+        raise HTTPException(
+            status_code=409,
+            detail="This board is the project's inbox; rename or archive the project instead",
+        )
+    except BoardRecordProjectNotFoundException:
+        raise HTTPException(status_code=404, detail="Project not found")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to update board")
+
+
+@boards_router.delete("/{board_id}", operation_id="delete_board", response_model=DeleteBoardResult)
+def delete_board(
+    current_user: CurrentUserOrDefault,
+    board_id: str = Path(description="The id of board to delete"),
+    include_images: Optional[bool] = Query(
+        description="Permanently delete all images and videos on the board", default=False
+    ),
+) -> DeleteBoardResult:
+    """Deletes a board: its owner's, or an admin's, to do"""
+    access = _assert_board_changes(board_id, current_user, [BoardAction.Delete])
+
+    # An owner deleting their board, admin or not, only deletes their own contributions, so what
+    # other users put on a shared board is preserved (it cascades to "uncategorized" via the FK on
+    # board_videos / board_images). Only an admin overriding, deleting someone else's board,
+    # deletes everything on it; that is the case the DTO reports as `admin_override`, so the client
+    # can warn before it.
+    cascade_user_id: Optional[str] = None if access.admin_override else current_user.user_id
+    deleted_images: list[str] = []
+    deleted_videos: list[str] = []
+    board_deleted = False
+
+    try:
+        if include_images is True:
+            assert_image_move_maintenance_inactive()
+
+        # Enumerate first, delete the board second, delete its media third. The order matters:
+        # a project's inbox must be refused *before* anything is destroyed, and the conditional
+        # delete is the only check that cannot lose a race against a project claiming the board.
+        # Membership rows are gone by the time the media is deleted (the board FK cascades), which
+        # is why the names have to be captured up front.
+        #
+        # Without `include_images` every membership is dropped regardless of who contributed it,
+        # so that enumeration is deliberately unfiltered.
+        enumerate_user_id = cascade_user_id if include_images is True else None
+        board_image_names = ApiDependencies.invoker.services.board_images.get_all_board_image_names_for_board(
+            board_id=board_id,
+            categories=None,
+            is_intermediate=None,
+            user_id=enumerate_user_id,
+        )
+        board_video_names = ApiDependencies.invoker.services.board_video_records.get_all_board_video_names_for_board(
+            board_id=board_id,
+            categories=None,
+            is_intermediate=None,
+            user_id=enumerate_user_id,
+        )
+
+        if not ApiDependencies.invoker.services.boards.delete_if_unclaimed(board_id=board_id):
+            # The access check above found the board, so it is either an inbox now or it vanished
+            # in between. Ask again rather than trusting the DTO, which predates any concurrent claim.
+            if board_id in ApiDependencies.invoker.services.board_records.get_inbox_board_ids([board_id]):
+                raise HTTPException(
+                    status_code=409,
+                    detail="This board is the project's inbox; delete the project instead",
+                )
+            raise HTTPException(status_code=404, detail="Board not found")
+        board_deleted = True
+
+        if include_images is True:
+            # The services report both outcomes: records whose file delete failed are
+            # preserved (they are already uncategorized, the board having gone) and returned
+            # as failures. This is the ground truth — reconstructing failures by diffing a
+            # router-side board listing against the deleted names would double the DB work and
+            # misreport items moved or deleted concurrently between the two queries.
+            deleted_images, failed_images = ApiDependencies.invoker.services.images.delete_images_by_names(
+                board_image_names
+            )
+            deleted_videos, failed_videos = ApiDependencies.invoker.services.videos.delete_videos_by_names(
+                board_video_names
+            )
+            return DeleteBoardResult(
+                board_id=board_id,
+                deleted_board_images=[],
+                deleted_images=deleted_images,
+                deleted_board_videos=[],
+                deleted_videos=deleted_videos,
+                failed_images=failed_images,
+                failed_videos=failed_videos,
+            )
+
+        return DeleteBoardResult(
+            board_id=board_id,
+            deleted_board_images=board_image_names,
+            deleted_images=[],
+            deleted_board_videos=board_video_names,
+            deleted_videos=[],
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        if include_images is True:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Failed to delete board media",
+                    "deleted_images": deleted_images,
+                    "deleted_videos": deleted_videos,
+                    "board_deleted": board_deleted,
+                },
+            )
+        raise HTTPException(status_code=500, detail="Failed to delete board")
+
+
+@boards_router.get(
+    "/",
+    operation_id="list_boards",
+    response_model=Union[OffsetPaginatedResults[BoardDTO], list[BoardDTO]],
+)
+def list_boards(
+    current_user: CurrentUserOrDefault,
+    order_by: BoardRecordOrderBy = Query(default=BoardRecordOrderBy.CreatedAt, description="The attribute to order by"),
+    direction: SQLiteDirection = Query(default=SQLiteDirection.Descending, description="The direction to order by"),
+    all: Optional[bool] = Query(default=None, description="Whether to list all boards"),
+    offset: Optional[int] = Query(default=None, ge=0, description="The page offset"),
+    limit: Optional[int] = Query(default=None, ge=0, le=MAX_PAGE_SIZE, description="The number of boards per page"),
+    include_archived: bool = Query(default=False, description="Whether or not to include archived boards in list"),
+) -> Union[OffsetPaginatedResults[BoardDTO], list[BoardDTO]]:
+    """Gets a list of boards for the current user, including shared boards. Admin users see all boards."""
+    if all:
+        return ApiDependencies.invoker.services.boards.get_all(
+            current_user.user_id, current_user.is_admin, order_by, direction, include_archived
+        )
+    elif offset is not None and limit is not None:
+        return ApiDependencies.invoker.services.boards.get_many(
+            current_user.user_id, current_user.is_admin, order_by, direction, offset, limit, include_archived
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid request: Must provide either 'all' or both 'offset' and 'limit'",
+        )
+
+
+@boards_router.get(
+    "/{board_id}/image_names",
+    operation_id="list_all_board_image_names",
+    response_model=list[str],
+)
+def list_all_board_image_names(
+    current_user: CurrentUserOrDefault,
+    board_id: str = Path(description="The id of the board or 'none' for uncategorized images"),
+    categories: list[ImageCategory] | None = Query(default=None, description="The categories of image to include."),
+    is_intermediate: bool | None = Query(default=None, description="Whether to list intermediate images."),
+) -> list[str]:
+    """Gets a list of images for a board"""
+
+    if board_id != "none":
+        _assert_board_read_access(board_id, current_user)
+
+    image_names = ApiDependencies.invoker.services.board_images.get_all_board_image_names_for_board(
+        board_id,
+        categories,
+        is_intermediate,
+    )
+
+    # For uncategorized images (board_id="none"), filter to only the caller's
+    # images so that one user cannot enumerate another's uncategorized images.
+    # Admin users can see all uncategorized images.
+    if board_id == "none" and not current_user.is_admin:
+        image_names = [
+            name
+            for name in image_names
+            if ApiDependencies.invoker.services.image_records.get_user_id(name) == current_user.user_id
+        ]
+
+    return image_names

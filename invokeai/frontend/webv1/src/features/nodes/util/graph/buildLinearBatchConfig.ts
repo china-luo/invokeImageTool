@@ -1,0 +1,106 @@
+import type { RootState } from 'app/store/store';
+import { generateSeeds } from 'common/util/generateSeeds';
+import { range } from 'es-toolkit/compat';
+import type { SeedBehaviour } from 'features/dynamicPrompts/store/dynamicPromptsSlice';
+import type { BaseModelType } from 'features/nodes/types/common';
+import type { Graph } from 'features/nodes/util/graph/generation/Graph';
+import { selectPresetModifiedPrompts } from 'features/nodes/util/graph/graphBuilderUtils';
+import type { components } from 'services/api/schema';
+import type { Batch, EnqueueBatchArg, Invocation } from 'services/api/types';
+
+const getExtendedPrompts = (arg: {
+  seedBehaviour: SeedBehaviour;
+  iterations: number;
+  prompts: string[];
+  base: BaseModelType;
+}): string[] => {
+  const { seedBehaviour, iterations, prompts } = arg;
+  if (seedBehaviour === 'PER_PROMPT') {
+    return range(iterations).flatMap(() => prompts);
+  }
+  return prompts;
+};
+
+export const prepareLinearUIBatch = (arg: {
+  state: RootState;
+  g: Graph;
+  prepend: boolean;
+  base: BaseModelType;
+  positivePromptNode: Invocation<'string'>;
+  negativePromptNode?: Invocation<'string'>;
+  seedNode?: Invocation<'integer'>;
+  origin: string;
+  destination: string;
+}): EnqueueBatchArg => {
+  const { state, g, base, prepend, positivePromptNode, negativePromptNode, seedNode, origin, destination } = arg;
+  const { iterations, shouldRandomizeSeed, seed } = state.params;
+  const { prompts, seedBehaviour } = state.dynamicPrompts;
+
+  const data: Batch['data'] = [];
+  const firstBatchDatumList: components['schemas']['BatchDatum'][] = [];
+  const secondBatchDatumList: components['schemas']['BatchDatum'][] = [];
+
+  // add seeds first to ensure the output order groups the prompts
+  if (seedNode && seedBehaviour === 'PER_PROMPT') {
+    const seeds = generateSeeds({
+      count: prompts.length * iterations,
+      start: shouldRandomizeSeed ? undefined : seed,
+    });
+
+    firstBatchDatumList.push({
+      node_path: seedNode.id,
+      field_name: 'value',
+      items: seeds,
+    });
+  } else if (seedNode && seedBehaviour === 'PER_ITERATION') {
+    // seedBehaviour = SeedBehaviour.PerRun
+    const seeds = generateSeeds({
+      count: iterations,
+      start: shouldRandomizeSeed ? undefined : seed,
+    });
+
+    secondBatchDatumList.push({
+      node_path: seedNode.id,
+      field_name: 'value',
+      items: seeds,
+    });
+    data.push(secondBatchDatumList);
+  }
+
+  const extendedPrompts = getExtendedPrompts({ seedBehaviour, iterations, prompts, base });
+
+  // zipped batch of prompts
+  firstBatchDatumList.push({
+    node_path: positivePromptNode.id,
+    field_name: 'value',
+    items: extendedPrompts,
+  });
+
+  if (negativePromptNode) {
+    const negativePrompt = selectPresetModifiedPrompts(state).negative;
+    firstBatchDatumList.push({
+      node_path: negativePromptNode.id,
+      field_name: 'value',
+      items: extendedPrompts.map(() => negativePrompt),
+    });
+  }
+
+  data.push(firstBatchDatumList);
+
+  // Models without a seed node (e.g. external API models without seed support) can't express
+  // PER_ITERATION via a seed batch dimension, so use batch.runs to repeat the graph instead.
+  const runs = !seedNode && seedBehaviour === 'PER_ITERATION' ? iterations : 1;
+
+  const enqueueBatchArg: EnqueueBatchArg = {
+    prepend,
+    batch: {
+      graph: g.getGraph(),
+      runs,
+      data,
+      origin,
+      destination,
+    },
+  };
+
+  return enqueueBatchArg;
+};

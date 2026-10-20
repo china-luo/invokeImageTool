@@ -1,0 +1,84 @@
+import {
+  IconButton,
+  Menu,
+  MenuButton,
+  MenuGroup,
+  MenuItem,
+  MenuList,
+  Portal,
+  useDisclosure,
+  useGlobalMenuClose,
+} from '@invoke-ai/ui-library';
+import AboutModal from 'features/system/components/AboutModal/AboutModal';
+import HotkeysModal from 'features/system/components/HotkeysModal/HotkeysModal';
+import { discordLink, githubLink } from 'features/system/store/constants';
+import { memo } from 'react';
+import { useTranslation } from 'react-i18next';
+import {
+  PiBookOpenBold,
+  PiBugBeetleBold,
+  PiGearSixFill,
+  PiInfoBold,
+  PiKeyboardBold,
+  PiToggleRightFill,
+} from 'react-icons/pi';
+import { RiDiscordFill, RiGithubFill } from 'react-icons/ri';
+
+import SettingsModal from './SettingsModal';
+const SettingsMenu = () => {
+  const { t } = useTranslation();
+  const { isOpen, onOpen, onClose } = useDisclosure();
+  useGlobalMenuClose(onClose);
+
+  return (
+    <Menu isOpen={isOpen} onOpen={onOpen} onClose={onClose} autoSelect={false}>
+      <MenuButton
+        as={IconButton}
+        variant="link"
+        aria-label={t('accessibility.menu')}
+        icon={<PiGearSixFill fontSize={20} />}
+        boxSize={8}
+      />
+      <Portal>
+        <MenuList>
+          <MenuGroup title={t('common.communityLabel')}>
+            <MenuItem as="a" href="https://invoke.ai/" target="_blank" icon={<PiBookOpenBold />}>
+              {t('common.userGuideLabel')}
+            </MenuItem>
+            <MenuItem as="a" href={githubLink} target="_blank" icon={<RiGithubFill />}>
+              {t('common.githubLabel')}
+            </MenuItem>
+            <MenuItem as="a" href={`${githubLink}/issues`} target="_blank" icon={<PiBugBeetleBold />}>
+              {t('common.reportBugLabel')}
+            </MenuItem>
+            <MenuItem as="a" href={discordLink} target="_blank" icon={<RiDiscordFill />}>
+              {t('common.discordLabel')}
+            </MenuItem>
+          </MenuGroup>
+
+          <MenuGroup title={t('common.settingsLabel')}>
+            <HotkeysModal>
+              <MenuItem as="button" icon={<PiKeyboardBold />}>
+                {t('common.hotkeysLabel')}
+              </MenuItem>
+            </HotkeysModal>
+            <SettingsModal>
+              <MenuItem as="button" icon={<PiToggleRightFill />}>
+                {t('common.settingsLabel')}
+              </MenuItem>
+            </SettingsModal>
+          </MenuGroup>
+          <MenuGroup title={t('accessibility.about')}>
+            <AboutModal>
+              <MenuItem as="button" icon={<PiInfoBold />}>
+                {t('accessibility.about')}
+              </MenuItem>
+            </AboutModal>
+          </MenuGroup>
+        </MenuList>
+      </Portal>
+    </Menu>
+  );
+};
+
+export default memo(SettingsMenu);

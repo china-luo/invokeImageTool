@@ -1,0 +1,35 @@
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Optional
+
+from PIL import Image
+
+from invokeai.app.services.workflow_records.workflow_records_common import WorkflowCategory
+
+
+class WorkflowThumbnailServiceBase(ABC):
+    """Base class for workflow thumbnail services"""
+
+    @abstractmethod
+    def get_path(self, workflow_id: str, with_hash: bool = True, category: Optional[WorkflowCategory] = None) -> Path:
+        """Gets the path to a workflow thumbnail. A caller that knows the workflow's category passes it, sparing a
+        read of the workflow."""
+        pass
+
+    @abstractmethod
+    def get_url(
+        self, workflow_id: str, with_hash: bool = True, category: Optional[WorkflowCategory] = None
+    ) -> str | None:
+        """Gets the URL of a workflow thumbnail. A caller that knows the workflow's category passes it, sparing a
+        read of the workflow."""
+        pass
+
+    @abstractmethod
+    def save(self, workflow_id: str, image: Image.Image) -> None:
+        """Saves a workflow thumbnail"""
+        pass
+
+    @abstractmethod
+    def delete(self, workflow_id: str) -> None:
+        """Deletes a workflow thumbnail"""
+        pass

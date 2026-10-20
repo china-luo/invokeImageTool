@@ -1,0 +1,39 @@
+import os
+from urllib.parse import quote
+
+from invokeai.app.services.urls.urls_base import UrlServiceBase
+
+
+class LocalUrlService(UrlServiceBase):
+    def __init__(self, base_url: str = "api/v1", base_url_v2: str = "api/v2"):
+        self._base_url = base_url
+        self._base_url_v2 = base_url_v2
+
+    def get_image_url(self, image_name: str, thumbnail: bool = False) -> str:
+        image_basename = os.path.basename(image_name)
+
+        # These paths are determined by the routes in invokeai/app/api/routers/images.py
+        if thumbnail:
+            return f"{self._base_url}/images/i/{image_basename}/thumbnail"
+
+        return f"{self._base_url}/images/i/{image_basename}/full"
+
+    def get_video_url(self, video_name: str, thumbnail: bool = False) -> str:
+        video_basename = os.path.basename(video_name)
+
+        # These paths are determined by the routes in invokeai/app/api/routers/videos.py
+        if thumbnail:
+            return f"{self._base_url}/videos/i/{video_basename}/thumbnail"
+
+        return f"{self._base_url}/videos/i/{video_basename}/full"
+
+    def get_model_image_url(self, model_key: str) -> str:
+        # A key stored by an older version can hold URL syntax (`?`, `#`, `%`); unencoded, `X?y` would address the
+        # route for model `X` instead of this image.
+        return f"{self._base_url_v2}/models/i/{quote(model_key, safe='')}/image"
+
+    def get_style_preset_image_url(self, style_preset_id: str) -> str:
+        return f"{self._base_url}/style_presets/i/{style_preset_id}/image"
+
+    def get_workflow_thumbnail_url(self, workflow_id: str) -> str:
+        return f"{self._base_url}/workflows/i/{workflow_id}/thumbnail"

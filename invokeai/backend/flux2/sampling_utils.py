@@ -1,0 +1,321 @@
+"""FLUX.2 Klein Sampling Utilities.
+
+FLUX.2 Klein uses a 32-channel VAE (AutoencoderKLFlux2) instead of the 16-channel VAE
+used by FLUX.1. This module provides sampling utilities adapted for FLUX.2.
+"""
+
+import math
+
+import torch
+from einops import rearrange
+
+from invokeai.backend.util.devices import TorchDevice
+
+
+def get_noise_flux2(
+    num_samples: int,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+) -> torch.Tensor:
+    """Generate noise for FLUX.2 Klein (32 channels).
+
+    FLUX.2 uses a 32-channel VAE, so noise must have 32 channels.
+    The spatial dimensions are calculated to allow for packing.
+
+    Args:
+        num_samples: Batch size.
+        height: Target image height in pixels.
+        width: Target image width in pixels.
+        device: Target device.
+        dtype: Target dtype.
+        seed: Random seed.
+
+    Returns:
+        Noise tensor of shape (num_samples, 32, latent_h, latent_w).
+    """
+    # We always generate noise on the same device and dtype then cast to ensure consistency.
+    rand_device = "cpu"
+    rand_dtype = TorchDevice.choose_noise_dtype(torch.float16)
+
+    # FLUX.2 uses 32 latent channels
+    # Latent dimensions: height/8, width/8 (from VAE downsampling)
+    # Must be divisible by 2 for packing (patchify step)
+    latent_h = 2 * math.ceil(height / 16)
+    latent_w = 2 * math.ceil(width / 16)
+
+    return torch.randn(
+        num_samples,
+        32,  # FLUX.2 uses 32 latent channels (vs 16 for FLUX.1)
+        latent_h,
+        latent_w,
+        device=rand_device,
+        dtype=rand_dtype,
+        generator=torch.Generator(device=rand_device).manual_seed(seed),
+    ).to(device=device, dtype=dtype)
+
+
+def pack_flux2(x: torch.Tensor) -> torch.Tensor:
+    """Pack latent image to flattened array of patch embeddings for FLUX.2.
+
+    This performs the patchify + pack operation in one step:
+    1. Patchify: Group 2x2 spatial patches into channels (C*4)
+    2. Pack: Flatten spatial dimensions to sequence
+
+    For 32-channel input: (B, 32, H, W) -> (B, H/2*W/2, 128)
+
+    Args:
+        x: Latent tensor of shape (B, 32, H, W).
+
+    Returns:
+        Packed tensor of shape (B, H/2*W/2, 128).
+    """
+    # Same operation as FLUX.1 pack, but input has 32 channels -> output has 128
+    return rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+
+
+def unpack_flux2(x: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Unpack flat array of patch embeddings back to latent image for FLUX.2.
+
+    This reverses the pack_flux2 operation:
+    1. Unpack: Restore spatial dimensions from sequence
+    2. Unpatchify: Restore 32 channels from 128
+
+    Args:
+        x: Packed tensor of shape (B, H/2*W/2, 128).
+        height: Target image height in pixels.
+        width: Target image width in pixels.
+
+    Returns:
+        Latent tensor of shape (B, 32, H, W).
+    """
+    # Calculate latent dimensions
+    latent_h = 2 * math.ceil(height / 16)
+    latent_w = 2 * math.ceil(width / 16)
+
+    # Packed dimensions (after patchify)
+    packed_h = latent_h // 2
+    packed_w = latent_w // 2
+
+    return rearrange(
+        x,
+        "b (h w) (c ph pw) -> b c (h ph) (w pw)",
+        h=packed_h,
+        w=packed_w,
+        ph=2,
+        pw=2,
+    )
+
+
+# Config for the scheduler the FLUX.2 txt2img path builds. Shared with the schedule-shift test so the
+# manual shift used by img2img/inpainting is always checked against the scheduler the node actually
+# uses, rather than against a copy that can drift out of sync.
+FLUX2_TXT2IMG_SCHEDULER_KWARGS = {
+    "num_train_timesteps": 1000,
+    "shift": 3.0,
+    "use_dynamic_shifting": True,
+    "base_shift": 0.5,
+    "max_shift": 1.15,
+    "base_image_seq_len": 256,
+    "max_image_seq_len": 4096,
+    "time_shift_type": "exponential",
+}
+
+
+def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
+    """Compute mu for FLUX.2 schedule shifting.
+
+    Uses a fixed mu value of 2.02, matching ComfyUI's proven FLUX.2 configuration.
+
+    The previous implementation (from diffusers' FLUX.1 pipeline) computed mu as a
+    linear function of image_seq_len, which produced excessively high values at
+    high resolutions (e.g., mu=3.23 at 2048x2048). This over-shifted the sigma
+    schedule, compressing almost all values above 0.9 and forcing the model to
+    denoise everything in the final 1-2 steps, causing severe grid/diamond artifacts.
+
+    ComfyUI uses a fixed shift=2.02 for FLUX.2 Klein at all resolutions and produces
+    artifact-free images even at 2048x2048.
+
+    Args:
+        image_seq_len: Number of image tokens (packed_h * packed_w). Currently unused.
+        num_steps: Number of denoising steps. Currently unused.
+
+    Returns:
+        The mu value (fixed at 2.02).
+    """
+    return 2.02
+
+
+def get_schedule_flux2(
+    num_steps: int,
+    image_seq_len: int,
+) -> list[float]:
+    """Get linear timestep schedule for FLUX.2.
+
+    Returns a linear sigma schedule from 1.0 to 1/num_steps.
+    The actual schedule shifting is handled by the FlowMatchEulerDiscreteScheduler
+    using the mu parameter and use_dynamic_shifting=True.
+
+    Args:
+        num_steps: Number of denoising steps.
+        image_seq_len: Number of image tokens (packed_h * packed_w). Currently unused,
+            but kept for API compatibility. The scheduler computes shifting internally.
+
+    Returns:
+        List of linear sigmas from 1.0 to 1/num_steps, plus final 0.0.
+    """
+    import numpy as np
+
+    # Create linear sigmas from 1.0 to 1/num_steps
+    # The scheduler will apply dynamic shifting using mu parameter
+    sigmas = np.linspace(1.0, 1 / num_steps, num_steps)
+    sigmas_list = [float(s) for s in sigmas]
+
+    # Add final 0.0 for the last step (scheduler needs n+1 timesteps for n steps)
+    sigmas_list.append(0.0)
+
+    return sigmas_list
+
+
+def time_shift_flux2(sigmas: list[float], mu: float) -> list[float]:
+    """Apply the exponential schedule shift that the txt2img scheduler applies internally.
+
+    ``get_schedule_flux2()`` returns an unshifted linear schedule because the
+    FlowMatchEulerDiscreteScheduler used for txt2img shifts it itself from ``mu``. Code paths that
+    step the schedule manually (img2img, inpainting) must apply the shift themselves, otherwise they
+    run the model on a completely different sigma trajectory than txt2img does: with 9 steps the
+    shifted schedule bottoms out at sigma 0.485, the linear one at 0.111. A distilled model such as
+    FLUX.2 Klein is never trained at the low end of the linear schedule and leaves a grainy residue
+    there.
+
+    Mirrors diffusers' ``FlowMatchEulerDiscreteScheduler._time_shift_exponential`` with an exponent
+    of 1.0, which is how the scheduler invokes it::
+
+        sigma' = exp(mu) / (exp(mu) + (1 / sigma - 1))
+
+    Args:
+        sigmas: Unshifted sigma schedule, descending from 1.0 to 0.0.
+        mu: Shift parameter, as returned by ``compute_empirical_mu()``.
+
+    Returns:
+        The shifted schedule. The 1.0 and 0.0 endpoints are fixed points of the transform and are
+        passed through directly to avoid a division by zero.
+    """
+    exp_mu = math.exp(mu)
+    return [
+        1.0 if sigma >= 1.0 else 0.0 if sigma <= 0.0 else exp_mu / (exp_mu + (1.0 / sigma - 1.0)) for sigma in sigmas
+    ]
+
+
+def unshift_flux2(sigmas: list[float], mu: float) -> list[float]:
+    """Invert :func:`time_shift_flux2`.
+
+    Solving ``sigma' = exp(mu) / (exp(mu) + (1 / sigma - 1))`` for ``sigma`` gives::
+
+        sigma = 1 / (exp(mu) * (1 / sigma' - 1) + 1)
+
+    Args:
+        sigmas: Shifted sigmas, descending from 1.0 to 0.0.
+        mu: The same shift parameter that produced them.
+
+    Returns:
+        The unshifted sigmas. As in the forward transform, 1.0 and 0.0 are fixed points and are
+        passed through directly to avoid a division by zero.
+    """
+    exp_mu = math.exp(mu)
+    return [
+        1.0 if sigma >= 1.0 else 0.0 if sigma <= 0.0 else 1.0 / (exp_mu * (1.0 / sigma - 1.0) + 1.0) for sigma in sigmas
+    ]
+
+
+def redensify_schedule_flux2(timesteps: list[float], num_steps: int, mu: float) -> list[float]:
+    """Re-space a clipped FLUX.2 schedule so it still takes ``num_steps`` steps.
+
+    Clipping a schedule to a denoising window keeps only the sigmas that happen to fall inside it, so
+    img2img at low strength runs far fewer steps than were requested. The shift makes that much worse
+    than it is on the unshifted schedule, because it pushes sigmas up and leaves the low end sparse:
+    at 4 steps and strength 0.2 the clipped window holds two steps, the last of which has to cover
+    0.715 -> 0 in a single Euler jump. The model reconstructs the whole image from that one jump and
+    the fine detail of the source image -- skin texture, pores, film grain -- does not survive it.
+
+    Resampling the window to the requested number of steps fixes that: the endpoints are held fixed
+    (so the img2img preblend at ``timesteps[0]`` is unaffected) and the interior is re-spaced. The
+    spacing is done in unshifted space and shifted back, so the result is the same curve the full
+    schedule follows through this window, just sampled more finely.
+
+    The schedule is only ever made denser, never sparser: if the clipped window already holds
+    ``num_steps`` steps or more -- which is the case for txt2img, and for any window wide enough not
+    to lose steps -- it is returned unchanged.
+
+    Args:
+        timesteps: The clipped, shifted schedule, descending.
+        num_steps: The number of steps that was requested.
+        mu: The shift parameter the schedule was shifted with.
+
+    Returns:
+        A schedule over the same sigma range with ``num_steps`` steps, or ``timesteps`` unchanged.
+    """
+    if num_steps < 1 or len(timesteps) < 2 or len(timesteps) - 1 >= num_steps:
+        return timesteps
+
+    start, end = unshift_flux2([timesteps[0], timesteps[-1]], mu)
+    if start <= end:
+        # Degenerate window: nothing to space out.
+        return timesteps
+
+    unshifted = [start + (end - start) * (i / num_steps) for i in range(num_steps + 1)]
+    respaced = time_shift_flux2(unshifted, mu)
+
+    # Pin the endpoints to the values that went in. Shifting back and forth is exact in theory but
+    # not in floating point, and both endpoints are load-bearing: timesteps[0] is the sigma the
+    # img2img start latents are blended at, and timesteps[-1] has to be exactly the end of the
+    # requested denoising range.
+    respaced[0] = timesteps[0]
+    respaced[-1] = timesteps[-1]
+    return respaced
+
+
+def generate_img_ids_flux2(h: int, w: int, batch_size: int, device: torch.device) -> torch.Tensor:
+    """Generate tensor of image position ids for FLUX.2 with RoPE scaling.
+
+    FLUX.2 uses 4D position coordinates (T, H, W, L) for its rotary position embeddings.
+    This is different from FLUX.1 which uses 3D coordinates.
+
+    RoPE Scaling: For resolutions >1536x1536, position IDs are scaled down using
+    Position Interpolation to prevent RoPE degradation and diamond/grid artifacts.
+
+    IMPORTANT: Position IDs must use int64 (long) dtype like diffusers, not bfloat16.
+    Using floating point dtype for position IDs can cause NaN in rotary embeddings.
+
+    Args:
+        h: Height of image in latent space.
+        w: Width of image in latent space.
+        batch_size: Batch size.
+        device: Device.
+
+    Returns:
+        Image position ids tensor of shape (batch_size, h/2*w/2, 4) with int64 dtype.
+    """
+    # After packing, spatial dims are h/2 x w/2
+    packed_h = h // 2
+    packed_w = w // 2
+
+    # Create coordinate grids - 4D: (T, H, W, L)
+    # T = time/batch index, H = height, W = width, L = layer/channel
+    # Use int64 (long) dtype like diffusers
+    img_ids = torch.zeros(packed_h, packed_w, 4, device=device, dtype=torch.long)
+
+    # T (time/batch) coordinate - set to 0 (already initialized)
+    # H coordinates
+    img_ids[..., 1] = torch.arange(packed_h, device=device, dtype=torch.long)[:, None]
+    # W coordinates
+    img_ids[..., 2] = torch.arange(packed_w, device=device, dtype=torch.long)[None, :]
+    # L (layer) coordinate - set to 0 (already initialized)
+
+    # Flatten and expand for batch
+    img_ids = img_ids.reshape(1, packed_h * packed_w, 4)
+    img_ids = img_ids.expand(batch_size, -1, -1)
+
+    return img_ids

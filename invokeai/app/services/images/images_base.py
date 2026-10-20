@@ -1,0 +1,216 @@
+from abc import ABC, abstractmethod
+from typing import Callable, Optional
+
+from PIL.Image import Image as PILImageType
+
+from invokeai.app.invocations.fields import MetadataField
+from invokeai.app.services.image_records.image_records_common import (
+    ImageCategory,
+    ImageNamesResult,
+    ImageRecord,
+    ImageRecordChanges,
+    ResourceOrigin,
+)
+from invokeai.app.services.images.images_common import ImageDTO
+from invokeai.app.services.shared.intermediate_delete import IntermediateDeleteGuard, IntermediateDeleteResult
+from invokeai.app.services.shared.pagination import OffsetPaginatedResults, SQLiteDirection
+
+
+class ImageServiceABC(ABC):
+    """High-level service for image management."""
+
+    _on_changed_callbacks: list[Callable[[ImageDTO], None]]
+    _on_deleted_callbacks: list[Callable[[str], None]]
+
+    def __init__(self) -> None:
+        self._on_changed_callbacks = []
+        self._on_deleted_callbacks = []
+
+    def on_changed(self, on_changed: Callable[[ImageDTO], None]) -> None:
+        """Register a callback for when an image is changed"""
+        self._on_changed_callbacks.append(on_changed)
+
+    def on_deleted(self, on_deleted: Callable[[str], None]) -> None:
+        """Register a callback for when an image is deleted"""
+        self._on_deleted_callbacks.append(on_deleted)
+
+    def _on_changed(self, item: ImageDTO) -> None:
+        for callback in self._on_changed_callbacks:
+            callback(item)
+
+    def notify_deleted(self, image_name: str) -> None:
+        """Notify registered listeners after an image record has been deleted."""
+        for callback in self._on_deleted_callbacks:
+            callback(image_name)
+
+    @abstractmethod
+    def create(
+        self,
+        image: PILImageType,
+        image_origin: ResourceOrigin,
+        image_category: ImageCategory,
+        node_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        board_id: Optional[str] = None,
+        is_intermediate: Optional[bool] = False,
+        metadata: Optional[str] = None,
+        workflow: Optional[str] = None,
+        graph: Optional[str] = None,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> ImageDTO:
+        """Creates an image, storing the file and its metadata."""
+        pass
+
+    @abstractmethod
+    def copy(
+        self,
+        source_image_name: str,
+        board_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> ImageDTO:
+        """Duplicates an existing image under a new identity, optionally onto a board.
+
+        The record is cloned and the file copied byte for byte — no decode, no re-encode — so
+        embedded metadata, workflow and graph travel with it. The copy is never intermediate and
+        is never starred.
+        """
+        pass
+
+    @abstractmethod
+    def update(
+        self,
+        image_name: str,
+        changes: ImageRecordChanges,
+    ) -> ImageDTO:
+        """Updates an image."""
+        pass
+
+    @abstractmethod
+    def get_pil_image(self, image_name: str) -> PILImageType:
+        """Gets an image as a PIL image."""
+        pass
+
+    @abstractmethod
+    def get_record(self, image_name: str) -> ImageRecord:
+        """Gets an image record."""
+        pass
+
+    @abstractmethod
+    def get_dto(self, image_name: str) -> ImageDTO:
+        """Gets an image DTO."""
+        pass
+
+    @abstractmethod
+    def get_metadata(self, image_name: str) -> Optional[MetadataField]:
+        """Gets an image's metadata."""
+        pass
+
+    @abstractmethod
+    def get_workflow(self, image_name: str) -> Optional[str]:
+        """Gets an image's workflow."""
+        pass
+
+    @abstractmethod
+    def get_graph(self, image_name: str) -> Optional[str]:
+        """Gets an image's workflow."""
+        pass
+
+    @abstractmethod
+    def get_path(self, image_name: str, thumbnail: bool = False) -> str:
+        """Gets an image's path."""
+        pass
+
+    @abstractmethod
+    def validate_path(self, path: str) -> bool:
+        """Validates an image's path."""
+        pass
+
+    @abstractmethod
+    def get_url(self, image_name: str, thumbnail: bool = False) -> str:
+        """Gets an image's or thumbnail's URL."""
+        pass
+
+    @abstractmethod
+    def get_many(
+        self,
+        offset: int = 0,
+        limit: int = 10,
+        starred_first: bool = True,
+        order_dir: SQLiteDirection = SQLiteDirection.Descending,
+        image_origin: Optional[ResourceOrigin] = None,
+        categories: Optional[list[ImageCategory]] = None,
+        is_intermediate: Optional[bool] = None,
+        board_id: Optional[str] = None,
+        search_term: Optional[str] = None,
+        created_from: Optional[str] = None,
+        created_to: Optional[str] = None,
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> OffsetPaginatedResults[ImageDTO]:
+        """Gets a paginated list of image DTOs with starred images first when starred_first=True.
+
+        created_from/created_to are inclusive YYYY-MM-DD bounds on created_at (UTC days).
+        """
+        pass
+
+    @abstractmethod
+    def delete(self, image_name: str):
+        """Deletes an image."""
+        pass
+
+    @abstractmethod
+    def delete_intermediates_by_names(
+        self, image_names: list[str], guard: Optional[IntermediateDeleteGuard] = None
+    ) -> IntermediateDeleteResult:
+        """Deletes the named images that are still intermediates, journalled, reporting the names removed.
+
+        ``guard`` is consulted on the deleting transaction so the cleanup policy's final check and
+        the record removal are one atomic step.
+        """
+        pass
+
+    @abstractmethod
+    def delete_images_by_names(self, image_names: list[str]) -> tuple[list[str], list[str]]:
+        """Deletes exactly these images; returns ``(deleted_names, failed_names)``.
+
+        For callers that must decide whether the deletion may proceed *before* destroying
+        anything, and so enumerate the names themselves. Same per-image failure semantics as
+        ``delete_images_on_board``.
+        """
+        pass
+
+    @abstractmethod
+    def delete_images_on_board(self, board_id: str, user_id: Optional[str] = None) -> tuple[list[str], list[str]]:
+        """Deletes all images on a board; returns ``(deleted_names, failed_names)``.
+
+        When ``user_id`` is provided, only images owned by that user are deleted (other users'
+        contributions to a public/shared board are preserved). Pass ``None`` for the admin
+        path to delete every image on the board regardless of uploader.
+
+        ``failed_names`` is the service's ground truth for per-image failures — callers must
+        not reconstruct it by diffing their own board listing against ``deleted_names``, which
+        races with concurrent moves/deletes.
+        """
+        pass
+
+    @abstractmethod
+    def get_image_names(
+        self,
+        starred_first: bool = True,
+        order_dir: SQLiteDirection = SQLiteDirection.Descending,
+        image_origin: Optional[ResourceOrigin] = None,
+        categories: Optional[list[ImageCategory]] = None,
+        is_intermediate: Optional[bool] = None,
+        board_id: Optional[str] = None,
+        search_term: Optional[str] = None,
+        created_from: Optional[str] = None,
+        created_to: Optional[str] = None,
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> ImageNamesResult:
+        """Gets ordered list of image names with metadata for optimistic updates.
+
+        created_from/created_to are inclusive YYYY-MM-DD bounds on created_at (UTC days).
+        """
+        pass

@@ -1,0 +1,190 @@
+from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from datetime import datetime
+from typing import Optional
+
+from invokeai.app.invocations.fields import MetadataField
+from invokeai.app.services.image_records.image_records_common import (
+    ImageCategory,
+    ImageNamesResult,
+    ImageRecord,
+    ImageRecordChanges,
+    ResourceOrigin,
+)
+from invokeai.app.services.shared.intermediate_delete import IntermediateDeleteGuard
+from invokeai.app.services.shared.pagination import OffsetPaginatedResults, SQLiteDirection
+
+
+class ImageRecordStorageBase(ABC):
+    """Low-level service responsible for interfacing with the image record store."""
+
+    # TODO: Implement an `update()` method
+
+    @abstractmethod
+    def get(self, image_name: str) -> ImageRecord:
+        """Gets an image record."""
+        pass
+
+    @abstractmethod
+    def exists(self, image_name: str) -> bool:
+        """Reports whether the image row is present, without reading it.
+
+        Separate from `get` because the callers that need this are deciding whether something is
+        gone, and `get` cannot answer that alone: it also deserializes, so a row written by a
+        newer version -- an enum value this one does not know -- fails the same way a missing row
+        does. A storage error still propagates, because "could not look" is not "not there".
+        """
+        pass
+
+    @abstractmethod
+    def get_metadata(self, image_name: str) -> Optional[MetadataField]:
+        """Gets an image's metadata'."""
+        pass
+
+    @abstractmethod
+    def update(
+        self,
+        image_name: str,
+        changes: ImageRecordChanges,
+    ) -> None:
+        """Updates an image record."""
+        pass
+
+    @abstractmethod
+    def get_many(
+        self,
+        offset: int = 0,
+        limit: int = 10,
+        starred_first: bool = True,
+        order_dir: SQLiteDirection = SQLiteDirection.Descending,
+        image_origin: Optional[ResourceOrigin] = None,
+        categories: Optional[list[ImageCategory]] = None,
+        is_intermediate: Optional[bool] = None,
+        board_id: Optional[str] = None,
+        search_term: Optional[str] = None,
+        created_from: Optional[str] = None,
+        created_to: Optional[str] = None,
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> OffsetPaginatedResults[ImageRecord]:
+        """Gets a page of image records.
+
+        When board_id is 'none', filters by user_id for per-user uncategorized images unless is_admin is True.
+        When board_id is 'all', returns uncategorized images and images on readable, non-archived boards.
+        Omitting board_id retains owner-only isolation for non-admin users.
+
+        created_from/created_to are inclusive YYYY-MM-DD bounds on created_at (UTC days).
+        """
+        pass
+
+    # TODO: The database has a nullable `deleted_at` column, currently unused.
+    # Should we implement soft deletes? Would need coordination with ImageFileStorage.
+    @abstractmethod
+    def delete(self, image_name: str) -> None:
+        """Deletes an image record."""
+        pass
+
+    @abstractmethod
+    def delete_many(self, image_names: list[str]) -> None:
+        """Deletes many image records."""
+        pass
+
+    @abstractmethod
+    def get_subfolders(self, image_names: list[str]) -> dict[str, str]:
+        """Maps each existing named image to its on-disk subfolder; absent names are omitted."""
+        pass
+
+    @abstractmethod
+    def iter_all_image_locations(self, batch_size: int = 500) -> Iterator[tuple[str, str]]:
+        """Yields all image name/subfolder pairs in key order using bounded keyset pages."""
+        pass
+
+    @abstractmethod
+    def delete_intermediates_by_names(
+        self, image_names: list[str], guard: Optional[IntermediateDeleteGuard] = None
+    ) -> list[str]:
+        """Deletes the named image records, skipping any that are no longer intermediates.
+
+        Returns the names whose records this call actually removed. Names that were already gone, and
+        names whose records survive because they are no longer intermediates, are both excluded, so a
+        caller purges the files of exactly the returned names and touches nothing else.
+        """
+        pass
+
+    @abstractmethod
+    def save(
+        self,
+        image_name: str,
+        image_origin: ResourceOrigin,
+        image_category: ImageCategory,
+        width: int,
+        height: int,
+        has_workflow: bool,
+        is_intermediate: Optional[bool] = False,
+        starred: Optional[bool] = False,
+        session_id: Optional[str] = None,
+        node_id: Optional[str] = None,
+        metadata: Optional[str] = None,
+        user_id: Optional[str] = None,
+        image_subfolder: str = "",
+        project_id: Optional[str] = None,
+    ) -> datetime:
+        """Saves an image record."""
+        pass
+
+    @abstractmethod
+    def set_file_size_bytes(self, image_name: str, file_size_bytes: Optional[int]) -> None:
+        """Records the measured on-disk size of an image and its thumbnail; None marks it unmeasured."""
+        pass
+
+    @abstractmethod
+    def set_file_sizes_bytes(self, sizes: dict[str, int]) -> None:
+        """Records many measured sizes in one transaction, leaving rows that already have a size."""
+        pass
+
+    @abstractmethod
+    def get_user_id(self, image_name: str) -> Optional[str]:
+        """Gets the user_id of the image owner. Returns None if image not found."""
+        pass
+
+    @abstractmethod
+    def get_most_recent_image_for_board(self, board_id: str) -> Optional[ImageRecord]:
+        """Gets the most recent image for a board."""
+        pass
+
+    @abstractmethod
+    def get_image_names(
+        self,
+        starred_first: bool = True,
+        order_dir: SQLiteDirection = SQLiteDirection.Descending,
+        image_origin: Optional[ResourceOrigin] = None,
+        categories: Optional[list[ImageCategory]] = None,
+        is_intermediate: Optional[bool] = None,
+        board_id: Optional[str] = None,
+        search_term: Optional[str] = None,
+        created_from: Optional[str] = None,
+        created_to: Optional[str] = None,
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> ImageNamesResult:
+        """Gets ordered list of image names with metadata for optimistic updates.
+
+        board_id supports the same 'none', 'all', concrete-ID, and omitted scopes as get_many().
+
+        created_from/created_to are inclusive YYYY-MM-DD bounds on created_at (UTC days).
+        """
+        pass
+
+    @abstractmethod
+    def get_image_names_by_date(
+        self,
+        date: str,
+        starred_first: bool = True,
+        order_dir: SQLiteDirection = SQLiteDirection.Descending,
+        categories: Optional[list[ImageCategory]] = None,
+        search_term: Optional[str] = None,
+        user_id: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> ImageNamesResult:
+        """Gets ordered list of image names for a specific date."""
+        pass

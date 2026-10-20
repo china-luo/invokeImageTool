@@ -1,0 +1,83 @@
+from abc import ABC, abstractmethod
+from typing import Optional
+
+from invokeai.app.services.board_access.board_access_common import BoardViewer
+from invokeai.app.services.board_records.board_records_common import BoardChanges, BoardRecordOrderBy
+from invokeai.app.services.boards.boards_common import BoardDTO
+from invokeai.app.services.shared.pagination import OffsetPaginatedResults, SQLiteDirection
+
+
+class BoardServiceABC(ABC):
+    """High-level service for board management."""
+
+    @abstractmethod
+    def create(
+        self,
+        board_name: str,
+        user_id: str,
+        project_id: Optional[str] = None,
+        *,
+        viewer: BoardViewer,
+    ) -> BoardDTO:
+        """Creates a board for a specific user, in one of their projects or in the Library, described to the
+        viewer (their role, allowed actions, the owner's name)."""
+        pass
+
+    @abstractmethod
+    def get_dto(
+        self,
+        board_id: str,
+        viewer: BoardViewer,
+    ) -> BoardDTO:
+        """Gets a board, described to the viewer."""
+        pass
+
+    @abstractmethod
+    def update(
+        self,
+        board_id: str,
+        changes: BoardChanges,
+        viewer: BoardViewer,
+    ) -> BoardDTO:
+        """Updates a board, returning it described to the viewer."""
+        pass
+
+    @abstractmethod
+    def delete_if_unclaimed(
+        self,
+        board_id: str,
+    ) -> bool:
+        """Delete a board unless it is a project's inbox. Returns whether it was deleted.
+
+        The only deletion there is. An unconditional `delete` used to sit beside this one with no
+        callers, which made "a project's board cannot be deleted out from under it" true by
+        coincidence rather than by construction — the next caller to reach for the obvious name
+        would have silently given it up.
+        """
+        pass
+
+    @abstractmethod
+    def get_many(
+        self,
+        user_id: str,
+        is_admin: bool,
+        order_by: BoardRecordOrderBy,
+        direction: SQLiteDirection,
+        offset: int = 0,
+        limit: int = 10,
+        include_archived: bool = False,
+    ) -> OffsetPaginatedResults[BoardDTO]:
+        """Gets many boards for a specific user, including shared boards. Admin users see all boards."""
+        pass
+
+    @abstractmethod
+    def get_all(
+        self,
+        user_id: str,
+        is_admin: bool,
+        order_by: BoardRecordOrderBy,
+        direction: SQLiteDirection,
+        include_archived: bool = False,
+    ) -> list[BoardDTO]:
+        """Gets all boards for a specific user, including shared boards. Admin users see all boards."""
+        pass

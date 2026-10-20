@@ -1,0 +1,999 @@
+"""Implementation of multithreaded download queue for invokeai."""
+
+import os
+import re
+import threading
+import time
+import traceback
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from queue import Empty, PriorityQueue
+from shutil import disk_usage
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set
+from urllib.parse import urljoin, urlparse
+
+import requests
+from pydantic.networks import AnyHttpUrl
+from requests import HTTPError
+from tqdm import tqdm
+
+from invokeai.app.services.config import InvokeAIAppConfig, get_config
+from invokeai.app.services.download.download_base import (
+    DownloadEventHandler,
+    DownloadExceptionHandler,
+    DownloadJob,
+    DownloadJobBase,
+    DownloadJobCancelledException,
+    DownloadJobStatus,
+    DownloadQueueServiceBase,
+    MultiFileDownloadJob,
+    ServiceInactiveException,
+    UnknownJobIDException,
+)
+from invokeai.app.util.misc import get_iso_timestamp
+from invokeai.app.util.ssrf import (
+    SsrfGuardedAdapter,
+    build_guarded_session,
+    validate_download_url,
+    warn_if_proxied,
+)
+from invokeai.backend.model_manager.metadata import RemoteModelFile
+from invokeai.backend.util.logging import InvokeAILogger
+
+if TYPE_CHECKING:
+    from invokeai.app.services.events.events_base import EventServiceBase
+
+# Maximum number of bytes to download during each call to requests.iter_content()
+DOWNLOAD_CHUNK_SIZE = 100000
+
+# How long an idle worker blocks on the queue before rechecking the stop event, which bounds how long stop() waits.
+_QUEUE_POLL_SECONDS = 1.0
+
+
+class DownloadQueueService(DownloadQueueServiceBase):
+    """Class for queued download of models."""
+
+    def __init__(
+        self,
+        max_parallel_dl: int = 5,
+        app_config: Optional[InvokeAIAppConfig] = None,
+        event_bus: Optional["EventServiceBase"] = None,
+        requests_session: Optional[requests.sessions.Session] = None,
+        requests_session_is_trusted: bool = False,
+    ):
+        """
+        Initialize DownloadQueue.
+
+        :param app_config: InvokeAIAppConfig object
+        :param max_parallel_dl: Number of simultaneous downloads allowed [5].
+        :param requests_session: Optional requests.sessions.Session object, for unit tests.
+        :param requests_session_is_trusted: Accept an unguarded caller-supplied session for unit tests.
+        """
+        self._app_config = app_config or get_config()
+        self._jobs: Dict[int, DownloadJob] = {}
+        self._download_part2parent: Dict[int, MultiFileDownloadJob] = {}
+        self._mfd_pending: Dict[int, list[DownloadJob]] = {}
+        self._mfd_active: Dict[int, DownloadJob] = {}
+        self._next_job_id = 0
+        self._queue: PriorityQueue[DownloadJob] = PriorityQueue()
+        self._stop_event = threading.Event()
+        self._job_terminated_event = threading.Event()
+        self._worker_pool: Set[threading.Thread] = set()
+        self._lock = threading.Lock()
+        self._logger = InvokeAILogger.get_logger("DownloadQueueService")
+        self._event_bus = event_bus
+        # A caller-supplied session is left exactly as given. Recognize Invoke's guarded
+        # adapter; mock transports require an explicit trust decision while the
+        # private-address policy is enabled.
+        self._request_proxies: Optional[Dict[str, str]] = None
+        if requests_session is not None:
+            if not self._app_config.allow_private_download_urls and not requests_session_is_trusted:
+                has_ssrf_guard = isinstance(
+                    requests_session.get_adapter("https://example.com"),
+                    SsrfGuardedAdapter,
+                )
+                if not has_ssrf_guard:
+                    raise ValueError(
+                        "An unguarded caller-supplied requests_session bypasses the SSRF socket guard. "
+                        "Pass requests_session_is_trusted=True only for a test session whose destination policy you trust."
+                    )
+            self._requests = requests_session
+        elif self._app_config.allow_private_download_urls:
+            # The operator has opted out of the address policy, so ambient proxy variables
+            # keep working here exactly as they always have — but an explicitly configured
+            # download_proxy must still be honored rather than silently ignored when both
+            # settings are present. It is applied per request (see the single call site in
+            # _do_download) because that is the only level that takes precedence over
+            # ambient *_PROXY variables in a plain Session.
+            self._requests = requests.Session()
+            if self._app_config.download_proxy:
+                proxy = self._app_config.download_proxy
+                self._request_proxies = {"http": proxy, "https": proxy}
+        else:
+            self._requests = build_guarded_session(proxy=self._app_config.download_proxy)
+            warn_if_proxied(self._requests, self._logger)
+        self._accept_download_requests = False
+        self._max_parallel_dl = max_parallel_dl
+
+    def start(self, *args: Any, **kwargs: Any) -> None:
+        """Start the download worker threads."""
+        with self._lock:
+            if self._worker_pool:
+                raise Exception("Attempt to start the download service twice")
+            self._stop_event.clear()
+            self._start_workers(self._max_parallel_dl)
+            self._accept_download_requests = True
+
+    def stop(self, *args: Any, **kwargs: Any) -> None:
+        """Stop workers after notifying queued and active jobs of cancellation or pause."""
+        with self._lock:
+            if not self._worker_pool:
+                return
+            self._accept_download_requests = False
+            queued_jobs = [x for x in self.list_jobs() if x.status == DownloadJobStatus.WAITING]
+            active_jobs = [x for x in self.list_jobs() if x.status == DownloadJobStatus.RUNNING]
+            if queued_jobs:
+                self._logger.warning(f"Stopping {len(queued_jobs)} queued downloads")
+            if active_jobs:
+                self._logger.info(f"Waiting for {len(active_jobs)} active download jobs to complete")
+            for job in self._jobs.values():
+                if not job.in_terminal_state and not job.paused:
+                    job.cancel()
+            workers = tuple(self._worker_pool)
+            self._stop_event.set()
+
+        # Jobs removed from the queue have no worker to deliver their terminal callback. Finalize them here so
+        # multifile owners can release staging claims after the queue has made them quiescent.
+        while True:
+            try:
+                job = self._queue.get_nowait()
+            except Empty:
+                break
+            try:
+                if job.paused:
+                    self._signal_job_paused(job)
+                elif not job.in_terminal_state:
+                    self._cleanup_cancelled_job(job)
+                    self._signal_job_cancelled(job)
+            finally:
+                job.job_ended = get_iso_timestamp()
+                self._job_terminated_event.set()
+                self._download_part2parent.pop(job.id, None)
+                self._queue.task_done()
+
+        for thread in workers:
+            thread.join()
+        with self._lock:
+            self._worker_pool.clear()
+
+    def submit_download_job(
+        self,
+        job: DownloadJob,
+        on_start: Optional[DownloadEventHandler] = None,
+        on_progress: Optional[DownloadEventHandler] = None,
+        on_complete: Optional[DownloadEventHandler] = None,
+        on_cancelled: Optional[DownloadEventHandler] = None,
+        on_error: Optional[DownloadExceptionHandler] = None,
+    ) -> None:
+        """Enqueue a download job."""
+        with self._lock:
+            if not self._accept_download_requests:
+                raise ServiceInactiveException(
+                    "The download service is not currently accepting requests. Please call start() to initialize the service."
+                )
+            if job.id == -1:
+                job.id = self._next_job_id
+                self._next_job_id += 1
+            job.set_callbacks(
+                on_start=on_start,
+                on_progress=on_progress,
+                on_complete=on_complete,
+                on_cancelled=on_cancelled,
+                on_error=on_error,
+            )
+            self._jobs[job.id] = job
+            self._queue.put(job)
+
+    def pause_job(self, job: DownloadJobBase) -> None:
+        """Pause the indicated job, preserving partial downloads."""
+        if job.status not in [DownloadJobStatus.WAITING, DownloadJobStatus.RUNNING]:
+            return
+        job.pause()
+        if isinstance(job, MultiFileDownloadJob):
+            for part in job.download_parts:
+                if part.status in [DownloadJobStatus.WAITING, DownloadJobStatus.RUNNING]:
+                    part.pause()
+
+    def download(
+        self,
+        source: AnyHttpUrl,
+        dest: Path,
+        priority: int = 10,
+        access_token: Optional[str] = None,
+        on_start: Optional[DownloadEventHandler] = None,
+        on_progress: Optional[DownloadEventHandler] = None,
+        on_complete: Optional[DownloadEventHandler] = None,
+        on_cancelled: Optional[DownloadEventHandler] = None,
+        on_error: Optional[DownloadExceptionHandler] = None,
+    ) -> DownloadJob:
+        """Create and enqueue a download job and return it."""
+        if not self._accept_download_requests:
+            raise ServiceInactiveException(
+                "The download service is not currently accepting requests. Please call start() to initialize the service."
+            )
+        job = DownloadJob(
+            source=source,
+            dest=dest,
+            priority=priority,
+            access_token=access_token or self._lookup_access_token(source),
+        )
+        self.submit_download_job(
+            job,
+            on_start=on_start,
+            on_progress=on_progress,
+            on_complete=on_complete,
+            on_cancelled=on_cancelled,
+            on_error=on_error,
+        )
+        return job
+
+    def multifile_download(
+        self,
+        parts: List[RemoteModelFile],
+        dest: Path,
+        access_token: Optional[str] = None,
+        submit_job: bool = True,
+        on_start: Optional[DownloadEventHandler] = None,
+        on_progress: Optional[DownloadEventHandler] = None,
+        on_complete: Optional[DownloadEventHandler] = None,
+        on_cancelled: Optional[DownloadEventHandler] = None,
+        on_error: Optional[DownloadExceptionHandler] = None,
+    ) -> MultiFileDownloadJob:
+        dest_root = dest.resolve()
+        mfdj = MultiFileDownloadJob(dest=dest_root, id=self._next_id())
+        mfdj.set_callbacks(
+            on_start=on_start,
+            on_progress=on_progress,
+            on_complete=on_complete,
+            on_cancelled=on_cancelled,
+            on_error=on_error,
+        )
+
+        for part in parts:
+            url = part.url
+            path = (dest_root / part.path).resolve()
+            if not path.is_relative_to(dest_root):
+                raise ValueError("only relative download paths accepted")
+            job = DownloadJob(
+                source=url,
+                dest=path,
+                access_token=access_token or self._lookup_access_token(url),
+            )
+            job.id = self._next_id()  # pre-assign ID so _download_part2parent can be keyed by ID
+            if part.size and part.size > 0:
+                job.total_bytes = part.size
+                job.expected_total_bytes = part.size
+            job.canonical_url = str(url)
+            mfdj.download_parts.add(job)
+            self._download_part2parent[job.id] = mfdj
+        if submit_job:
+            self.submit_multifile_download(mfdj)
+        return mfdj
+
+    def submit_multifile_download(self, job: MultiFileDownloadJob) -> None:
+        pending = sorted(job.download_parts, key=lambda j: str(j.source))
+        with self._lock:
+            self._mfd_pending[job.id] = list(pending)
+            self._mfd_active.pop(job.id, None)
+        self._submit_next_mfd_part(job)
+
+    def _submit_next_mfd_part(self, job: MultiFileDownloadJob) -> None:
+        with self._lock:
+            pending = self._mfd_pending.get(job.id, [])
+            if not pending or self._mfd_active.get(job.id) is not None or job.in_terminal_state:
+                return
+            if not self._accept_download_requests:
+                paused = all(part.in_terminal_state or part.paused for part in job.download_parts)
+                self._finalize_multifile_cancellation(job, paused=paused)
+                return
+            download_job = pending.pop(0)
+            self._mfd_active[job.id] = download_job
+
+        try:
+            self.submit_download_job(
+                download_job,
+                on_start=self._mfd_started,
+                on_progress=self._mfd_progress,
+                on_complete=self._mfd_complete,
+                on_cancelled=self._mfd_cancelled,
+                on_error=self._mfd_error,
+            )
+        except ServiceInactiveException:
+            # Shutdown can close submissions after the active part completes but before its successor is queued.
+            with self._lock:
+                if not job.in_terminal_state:
+                    paused = all(part.in_terminal_state or part.paused for part in job.download_parts)
+                    self._finalize_multifile_cancellation(job, paused=paused)
+
+    def join(self) -> None:
+        """Wait for all jobs to complete."""
+        self._queue.join()
+
+    def _next_id(self) -> int:
+        with self._lock:
+            id = self._next_job_id
+            self._next_job_id += 1
+        return id
+
+    def list_jobs(self) -> List[DownloadJob]:
+        """List all the jobs."""
+        return list(self._jobs.values())
+
+    def prune_jobs(self) -> None:
+        """Prune completed and errored queue items from the job list."""
+        with self._lock:
+            to_delete = set()
+            for job_id, job in self._jobs.items():
+                if job.in_terminal_state:
+                    to_delete.add(job_id)
+            for job_id in to_delete:
+                del self._jobs[job_id]
+
+    def id_to_job(self, id: int) -> DownloadJob:
+        """Translate a job ID into a DownloadJob object."""
+        try:
+            return self._jobs[id]
+        except KeyError as excp:
+            raise UnknownJobIDException("Unrecognized job") from excp
+
+    def cancel_job(self, job: DownloadJobBase) -> None:
+        """
+        Cancel the indicated job.
+
+        If it is running it will be stopped.
+        job.status will be set to DownloadJobStatus.CANCELLED
+        """
+        if job.status in [DownloadJobStatus.WAITING, DownloadJobStatus.RUNNING]:
+            job.cancel()
+            if isinstance(job, MultiFileDownloadJob):
+                for part in job.download_parts:
+                    if part.status in [DownloadJobStatus.WAITING, DownloadJobStatus.RUNNING]:
+                        part.cancel()
+
+    def cancel_all_jobs(self) -> None:
+        """Cancel all jobs (those not in enqueued, running or paused state)."""
+        for job in self._jobs.values():
+            if not job.in_terminal_state:
+                self.cancel_job(job)
+
+    def wait_for_job(self, job: DownloadJobBase, timeout: int = 0) -> DownloadJobBase:
+        """Block until the indicated job has reached terminal state, or when timeout limit reached."""
+        start = time.time()
+        while not job.in_terminal_state:
+            if self._job_terminated_event.wait(timeout=0.25):  # in case we miss an event
+                self._job_terminated_event.clear()
+            if timeout > 0 and time.time() - start > timeout:
+                raise TimeoutError("Timeout exceeded")
+        return job
+
+    def _start_workers(self, max_workers: int) -> None:
+        """Start the requested number of worker threads."""
+        self._stop_event.clear()
+        for i in range(0, max_workers):  # noqa B007
+            worker = threading.Thread(target=self._download_next_item, daemon=True)
+            self._logger.debug(f"Download queue worker thread {worker.name} starting.")
+            worker.start()
+            self._worker_pool.add(worker)
+
+    def _download_next_item(self) -> None:
+        """Worker thread gets next job on priority queue."""
+        done = False
+        while not done:
+            if self._stop_event.is_set():
+                done = True
+                continue
+            try:
+                job = self._queue.get(timeout=_QUEUE_POLL_SECONDS)
+            except Empty:
+                continue
+            try:
+                if job.cancelled:
+                    raise DownloadJobCancelledException("Job was cancelled before start")
+                job.job_started = get_iso_timestamp()
+                self._do_download(job)
+                if job.status != DownloadJobStatus.COMPLETED:
+                    self._signal_job_complete(job)
+            except DownloadJobCancelledException:
+                if job.paused:
+                    self._signal_job_paused(job)
+                else:
+                    self._cleanup_cancelled_job(job)
+                    self._signal_job_cancelled(job)
+            except Exception as excp:
+                job.error_type = excp.__class__.__name__ + f"({str(excp)})"
+                job.error = traceback.format_exc()
+                self._signal_job_error(job, excp)
+            finally:
+                job.job_ended = get_iso_timestamp()
+                self._job_terminated_event.set()  # signal a change to terminal state
+                self._download_part2parent.pop(job.id, None)  # if this is a subpart of a multipart job, remove it
+                self._queue.task_done()
+
+        self._logger.debug(f"Download queue worker thread {threading.current_thread().name} exiting.")
+
+    def _do_download(self, job: DownloadJob) -> None:
+        """Do the actual download."""
+
+        url = job.canonical_url or str(job.source)
+        header = {"Authorization": f"Bearer {job.access_token}"} if job.access_token else {}
+        had_resume_metadata = bool(job.etag or job.last_modified)
+        open_mode = "wb"
+        resume_from = 0
+
+        if not job.dest.is_dir():
+            job.download_path = job.dest
+            in_progress_path = self._in_progress_path(job.download_path)
+            if in_progress_path.exists():
+                resume_from = in_progress_path.stat().st_size
+                job.bytes = resume_from
+                self._logger.debug(
+                    f"Resume check: in-progress file found at {in_progress_path} size={resume_from} bytes"
+                )
+                if resume_from > 0:
+                    if job.etag:
+                        header["If-Range"] = job.etag
+                    elif job.last_modified:
+                        header["If-Range"] = job.last_modified
+                    header["Range"] = f"bytes={resume_from}-"
+                    open_mode = "ab"
+            else:
+                self._logger.debug(f"Resume check: no in-progress file at {in_progress_path}")
+        elif job.download_path:
+            # Resume for directory downloads when we already know the filename.
+            in_progress_path = self._in_progress_path(job.download_path)
+            if in_progress_path.exists():
+                resume_from = in_progress_path.stat().st_size
+                job.bytes = resume_from
+                self._logger.debug(
+                    f"Resume check (dir): in-progress file found at {in_progress_path} size={resume_from} bytes"
+                )
+                if resume_from > 0:
+                    if job.etag:
+                        header["If-Range"] = job.etag
+                    elif job.last_modified:
+                        header["If-Range"] = job.last_modified
+                    header["Range"] = f"bytes={resume_from}-"
+                    open_mode = "ab"
+            else:
+                self._logger.debug(f"Resume check (dir): no in-progress file at {in_progress_path}")
+        elif job.dest.is_dir():
+            # Attempt to infer a single in-progress file from disk for directory downloads.
+            try:
+                candidates = sorted(job.dest.glob("*.downloading"))
+            except OSError:
+                candidates = []
+            if len(candidates) == 1:
+                inferred = candidates[0].with_name(candidates[0].name.removesuffix(".downloading"))
+                job.download_path = inferred
+                try:
+                    resume_from = candidates[0].stat().st_size
+                except FileNotFoundError:
+                    # The .downloading file was renamed/deleted between glob and stat (race condition); skip resume.
+                    job.download_path = None
+                else:
+                    job.bytes = resume_from
+                    self._logger.debug(
+                        f"Resume check (dir): inferred in-progress file path={candidates[0]} size={resume_from} bytes"
+                    )
+                    if resume_from > 0:
+                        if job.etag:
+                            header["If-Range"] = job.etag
+                        elif job.last_modified:
+                            header["If-Range"] = job.last_modified
+                        header["Range"] = f"bytes={resume_from}-"
+                        open_mode = "ab"
+            else:
+                self._logger.debug(
+                    "Resume check (dir): no prior download_path available; cannot resume from disk "
+                    f"(candidates={len(candidates)})"
+                )
+
+        if resume_from == 0:
+            job.bytes = 0
+            if had_resume_metadata:
+                job.resume_from_scratch = True
+                job.resume_message = "Partial file missing. Restarted download from the beginning."
+
+        # Make a streaming request. This will retrieve headers including
+        # content-length and content-disposition, but not fetch any content itself.
+        # The URL is checked here rather than at submit time so that it is the address we
+        # are about to connect to that gets vetted, and the response hook re-checks every
+        # redirect hop — otherwise a public URL could bounce us onto a private address.
+        self._validate_url(url)
+        resp = self._requests.get(
+            str(url),
+            headers=header,
+            stream=True,
+            hooks={"response": self._reject_unsafe_redirect},
+            proxies=self._request_proxies,
+        )
+        job.final_url = str(resp.url) if resp.url else None
+        self._logger.debug(
+            "Resume response: "
+            f"status={resp.status_code} "
+            f"content_length={resp.headers.get('content-length')} "
+            f"content_range={resp.headers.get('Content-Range')} "
+            f"etag={resp.headers.get('ETag')} "
+            f"last_modified={resp.headers.get('Last-Modified')}"
+        )
+        if resp.status_code == 416 and resume_from > 0:
+            # Range not satisfiable - local partial is already complete
+            match = re.fullmatch(r"bytes \*/(\d+)", resp.headers.get("Content-Range", ""), flags=re.IGNORECASE)
+            # Content-Range is optional on 416 responses. Reuse the size known when
+            # the download started, but never resume_from itself: that would accept
+            # every partial file as complete.
+            expected = int(match.group(1)) if match else (job.expected_total_bytes or job.total_bytes or None)
+            if expected is not None and resume_from == expected:
+                job.total_bytes = expected
+                job.expected_total_bytes = expected
+                job.bytes = resume_from
+                job.download_path = job.download_path or job.dest
+                self._in_progress_path(job.download_path).rename(job.download_path)
+                self._signal_job_started(job)
+                self._signal_job_complete(job)
+                return
+            job.resume_required = True
+            job.resume_message = "Resume refused by server. Restart required."
+            job.pause()
+            raise DownloadJobCancelledException("Resume refused by server. Restart required.")
+        if not resp.ok:
+            host = urlparse(str(resp.url or url)).netloc
+            status = resp.status_code
+            reason = resp.reason
+            if status >= 500:
+                self._logger.error(f"Remote server error from {host}: HTTP {status} {reason}")
+                raise HTTPError(reason)
+            self._logger.error(f"Download failed from {host}: HTTP {status} {reason}")
+            raise HTTPError(reason)
+
+        job.content_type = resp.headers.get("Content-Type")
+        job.etag = resp.headers.get("ETag") or job.etag
+        job.last_modified = resp.headers.get("Last-Modified") or job.last_modified
+        content_length = int(resp.headers.get("content-length", 0))
+
+        if job.dest.is_dir():
+            parsed_url = urlparse(str(url))
+            file_name = os.path.basename(parsed_url.path)  # default is to use the last bit of the URL
+
+            if match := re.search('filename="(.+)"', resp.headers.get("Content-Disposition", "")):
+                remote_name = match.group(1)
+                if self._validate_filename(job.dest.as_posix(), remote_name):
+                    file_name = remote_name
+
+            # The URL path is attacker-influenced too -- a final segment of ".." would
+            # otherwise put download_path one level above dest.
+            if not self._validate_filename(job.dest.as_posix(), file_name):
+                raise ValueError(f"Cannot derive a safe filename for {url} from '{file_name}'")
+
+            job.download_path = job.dest / file_name
+
+        else:
+            job.dest.parent.mkdir(parents=True, exist_ok=True)
+            job.download_path = job.dest
+
+        assert job.download_path
+
+        in_progress_path = self._in_progress_path(job.download_path)
+
+        if resume_from > 0 and resp.status_code == 200:
+            # Server ignored Range. Restart download from scratch.
+            job.resume_required = True
+            job.resume_message = "Resume refused by server. Restart required."
+            job.pause()
+            raise DownloadJobCancelledException("Resume refused by server. Restart required.")
+
+        if resume_from > 0 and resp.status_code == 206:
+            content_range = resp.headers.get("Content-Range", "")
+            total_from_range = None
+            if match := re.match(r"bytes\s+\d+-\d+/(\d+)", content_range):
+                total_from_range = int(match.group(1))
+            if total_from_range is not None:
+                job.total_bytes = total_from_range
+            else:
+                job.total_bytes = resume_from + content_length
+            job.bytes = resume_from
+            job.expected_total_bytes = job.total_bytes
+        else:
+            job.total_bytes = content_length
+            job.expected_total_bytes = content_length
+
+        if job.download_path.exists() and resume_from == 0:
+            existing_size = job.download_path.stat().st_size
+            if job.total_bytes > 0 and existing_size == job.total_bytes:
+                job.bytes = existing_size
+                self._signal_job_started(job)
+                self._signal_job_complete(job)
+                return
+            # Existing file does not match expected size; treat as corrupt and restart.
+            self._logger.debug(
+                "Resume check: existing file size mismatch; deleting and restarting "
+                f"path={job.download_path} existing_size={existing_size} expected={job.total_bytes}"
+            )
+            job.download_path.unlink()
+
+        free_space = disk_usage(job.download_path.parent).free
+        GB = 2**30
+        remaining_bytes = max(job.total_bytes - job.bytes, 0)
+        if free_space < remaining_bytes:
+            raise RuntimeError(
+                f"Free disk space {free_space / GB:.2f} GB is not enough for download of {remaining_bytes / GB:.2f} GB."
+            )
+
+        # Don't clobber an existing file. See commit 82c2c85202f88c6d24ff84710f297cfc6ae174af
+        # for code that instead resumes an interrupted download.
+        if job.download_path.exists() and resume_from == 0:
+            raise OSError(f"[Errno 17] File {job.download_path} exists")
+
+        # append ".downloading" to the path
+        # signal caller that the download is starting. At this point, key fields such as
+        # download_path and total_bytes will be populated. We call it here because the might
+        # discover that the local file is already complete and generate a COMPLETED status.
+        self._signal_job_started(job)
+
+        expected_total = job.total_bytes or job.expected_total_bytes or content_length
+        # "range not satisfiable" - local file is at least as large as the remote file
+        if resp.status_code == 416 or (expected_total > 0 and job.bytes >= expected_total):
+            self._logger.info(f"{job.download_path}: complete file found. Skipping.")
+            return
+
+        # "partial content" - local file is smaller than remote file
+        elif resp.status_code == 206 or job.bytes > 0:
+            self._logger.info(f"{job.download_path}: partial file found. Resuming")
+
+        # some other error
+        elif resp.status_code != 200:
+            host = urlparse(str(resp.url or url)).netloc
+            status = resp.status_code
+            reason = resp.reason
+            if status >= 500:
+                self._logger.error(f"Remote server error from {host}: HTTP {status} {reason}")
+                raise HTTPError(reason)
+            self._logger.error(f"Download failed from {host}: HTTP {status} {reason}")
+            raise HTTPError(reason)
+
+        self._logger.debug(f"{job.source}: Downloading {job.download_path}")
+        report_delta = job.total_bytes / 100  # report every 1% change
+        last_report_bytes = 0
+
+        # DOWNLOAD LOOP
+        with open(in_progress_path, open_mode) as file:
+            for data in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                if job.cancelled:
+                    raise DownloadJobCancelledException("Job was cancelled at caller's request")
+
+                job.bytes += file.write(data)
+                if (job.bytes - last_report_bytes >= report_delta) or (job.bytes >= job.total_bytes):
+                    last_report_bytes = job.bytes
+                    self._signal_job_progress(job)
+
+        if job.total_bytes > 0 and job.bytes < job.total_bytes:
+            job.resume_required = True
+            job.resume_message = "Download interrupted. Resume required."
+            job.pause()
+            raise DownloadJobCancelledException("Download interrupted. Resume required.")
+
+        # if we get here we are done and can rename the file to the original dest
+        self._logger.debug(f"{job.source}: saved to {job.download_path} (bytes={job.bytes})")
+        in_progress_path.rename(job.download_path)
+
+    def _validate_url(self, url: str) -> None:
+        """Refuse to fetch URLs that point at addresses only the server can reach."""
+        validate_download_url(str(url), allow_private_urls=self._app_config.allow_private_download_urls)
+
+    def _reject_unsafe_redirect(self, response: requests.Response, *args: Any, **kwargs: Any) -> requests.Response:
+        """Response hook: vet each redirect target before `requests` follows it."""
+        if response.is_redirect or response.is_permanent_redirect:
+            location = response.headers.get("location")
+            if location:
+                try:
+                    self._validate_url(urljoin(response.url, location))
+                except Exception:
+                    response.close()
+                    raise
+        return response
+
+    def _validate_filename(self, directory: str, filename: str) -> bool:
+        pc_name_max = get_pc_name_max(directory)
+        pc_path_max = get_pc_path_max(directory)
+        # The name must be a single path component. A remote server picks this value, so
+        # separators of either flavour, drive letters and '..' all have to be rejected --
+        # on Windows `Path(dir) / "..\\evil"` escapes `dir` even though it has no '/'.
+        if "/" in filename or "\\" in filename:
+            return False
+        if filename in ("", ".", ".."):
+            return False
+        if filename.startswith(".."):
+            return False
+        if PurePosixPath(filename).is_absolute() or PureWindowsPath(filename).is_absolute():
+            return False
+        # `WindowsPath("D:/dest") / "C:evil"` yields "C:evil" -- a drive-relative name
+        # replaces the destination entirely without ever looking absolute.
+        if PureWindowsPath(filename).drive:
+            return False
+        if len(filename) > pc_name_max:
+            return False
+        if len(os.path.join(directory, filename)) > pc_path_max:
+            return False
+        return True
+
+    def _in_progress_path(self, path: Path) -> Path:
+        return path.with_name(path.name + ".downloading")
+
+    def _lookup_access_token(self, source: AnyHttpUrl) -> Optional[str]:
+        # Pull the token from config if it exists and matches the URL
+        token = None
+        for pair in self._app_config.remote_api_tokens or []:
+            if re.search(pair.url_regex, str(source)):
+                token = pair.token
+                break
+        return token
+
+    def _signal_job_started(self, job: DownloadJob) -> None:
+        job.status = DownloadJobStatus.RUNNING
+        self._execute_cb(job, "on_start")
+        if self._event_bus:
+            self._event_bus.emit_download_started(job)
+
+    def _signal_job_progress(self, job: DownloadJob) -> None:
+        self._execute_cb(job, "on_progress")
+        if self._event_bus:
+            self._event_bus.emit_download_progress(job)
+
+    def _signal_job_complete(self, job: DownloadJob) -> None:
+        job.status = DownloadJobStatus.COMPLETED
+        self._execute_cb(job, "on_complete")
+        if self._event_bus:
+            self._event_bus.emit_download_complete(job)
+
+    def _signal_job_cancelled(self, job: DownloadJob) -> None:
+        if job.status not in [DownloadJobStatus.RUNNING, DownloadJobStatus.WAITING]:
+            return
+        job.status = DownloadJobStatus.CANCELLED
+        self._execute_cb(job, "on_cancelled")
+        if self._event_bus:
+            self._event_bus.emit_download_cancelled(job)
+
+        # if multifile download, then signal the parent
+        if parent_job := self._download_part2parent.get(job.id, None):
+            if not parent_job.in_terminal_state:
+                parent_job.status = DownloadJobStatus.CANCELLED
+                self._execute_cb(parent_job, "on_cancelled")
+
+    def _signal_job_paused(self, job: DownloadJob) -> None:
+        if job.status not in [DownloadJobStatus.RUNNING, DownloadJobStatus.WAITING]:
+            return
+        if job.download_path:
+            in_progress_path = self._in_progress_path(job.download_path)
+            if in_progress_path.exists():
+                job.bytes = in_progress_path.stat().st_size
+        job.status = DownloadJobStatus.PAUSED
+        self._execute_cb(job, "on_cancelled")
+        if self._event_bus:
+            self._event_bus.emit_download_paused(job)
+
+        if parent_job := self._download_part2parent.get(job.id, None):
+            if not parent_job.in_terminal_state:
+                parent_job.status = DownloadJobStatus.PAUSED
+                self._execute_cb(parent_job, "on_cancelled")
+
+    def _signal_job_error(self, job: DownloadJob, excp: Optional[Exception] = None) -> None:
+        job.status = DownloadJobStatus.ERROR
+        self._logger.error(f"{str(job.source)}: {traceback.format_exception(excp)}")
+        self._execute_cb(job, "on_error", excp)
+
+        if self._event_bus:
+            self._event_bus.emit_download_error(job)
+
+    def _cleanup_cancelled_job(self, job: DownloadJob) -> None:
+        if job.paused:
+            return
+        self._logger.debug(f"Cleaning up leftover files from cancelled download job {job.download_path}")
+        try:
+            if job.download_path:
+                partial_file = self._in_progress_path(job.download_path)
+                partial_file.unlink()
+        except OSError as excp:
+            self._logger.warning(excp)
+
+    ########################################
+    # callbacks used for multifile downloads
+    ########################################
+    def _mfd_started(self, download_job: DownloadJob) -> None:
+        self._logger.info(f"File download started: {download_job.source}")
+        with self._lock:
+            mf_job = self._download_part2parent[download_job.id]
+            if mf_job.waiting:
+                mf_job.total_bytes = sum(x.total_bytes for x in mf_job.download_parts)
+                mf_job.status = DownloadJobStatus.RUNNING
+                assert download_job.download_path is not None
+                path_relative_to_destdir = download_job.download_path.relative_to(mf_job.dest)
+                mf_job.download_path = (
+                    mf_job.dest / path_relative_to_destdir.parts[0]
+                )  # keep just the first component of the path
+                self._execute_cb(mf_job, "on_start")
+
+    def _mfd_progress(self, download_job: DownloadJob) -> None:
+        with self._lock:
+            mf_job = self._download_part2parent[download_job.id]
+            if mf_job.cancelled:
+                for part in mf_job.download_parts:
+                    self.cancel_job(part)
+            elif mf_job.running:
+                mf_job.total_bytes = sum(x.total_bytes for x in mf_job.download_parts)
+                mf_job.bytes = sum(x.bytes for x in mf_job.download_parts)
+                self._execute_cb(mf_job, "on_progress")
+
+    def _mfd_complete(self, download_job: DownloadJob) -> None:
+        self._logger.info(f"Download complete: {download_job.source}")
+        submit_next = False
+        mf_job: Optional[MultiFileDownloadJob] = None
+        with self._lock:
+            mf_job = self._download_part2parent[download_job.id]
+            self._mfd_active.pop(mf_job.id, None)
+            mf_job.total_bytes = sum(x.total_bytes for x in mf_job.download_parts)
+            mf_job.bytes = sum(x.bytes for x in mf_job.download_parts)
+
+            if mf_job.cancelled:
+                self._finalize_multifile_cancellation(mf_job, paused=False)
+            elif all(part.complete for part in mf_job.download_parts):
+                self._mfd_pending.pop(mf_job.id, None)
+                mf_job.status = DownloadJobStatus.COMPLETED
+                self._execute_cb(mf_job, "on_complete")
+            elif all(part.in_terminal_state or part.paused for part in mf_job.download_parts):
+                self._finalize_multifile_cancellation(mf_job, paused=True)
+            elif not mf_job.in_terminal_state:
+                submit_next = True
+
+            self._job_terminated_event.set()
+        if submit_next and mf_job is not None:
+            self._submit_next_mfd_part(mf_job)
+
+    def _finalize_multifile_cancellation(self, mf_job: MultiFileDownloadJob, *, paused: bool) -> None:
+        """Finalize a multifile transfer after its active part stops touching disk."""
+        if mf_job.in_terminal_state:
+            return
+        self._mfd_active.pop(mf_job.id, None)
+        self._mfd_pending.pop(mf_job.id, None)
+        for part in mf_job.download_parts:
+            if part.in_terminal_state:
+                self._download_part2parent.pop(part.id, None)
+                continue
+            if paused:
+                part.pause()
+                part.status = DownloadJobStatus.PAUSED
+            else:
+                part.cancel()
+                self._cleanup_cancelled_job(part)
+                part.status = DownloadJobStatus.CANCELLED
+            part.job_ended = get_iso_timestamp()
+            self._download_part2parent.pop(part.id, None)
+
+        if paused:
+            mf_job.pause()
+            mf_job.status = DownloadJobStatus.PAUSED
+        else:
+            mf_job.cancel()
+            mf_job.status = DownloadJobStatus.CANCELLED
+        self._execute_cb(mf_job, "on_cancelled")
+        self._job_terminated_event.set()
+
+    def _mfd_cancelled(self, download_job: DownloadJob) -> None:
+        with self._lock:
+            mf_job = self._download_part2parent.get(download_job.id)
+            if mf_job is None:
+                return
+            self._finalize_multifile_cancellation(mf_job, paused=download_job.paused)
+
+    def _mfd_error(self, download_job: DownloadJob, excp: Optional[Exception] = None) -> None:
+        with self._lock:
+            mf_job = self._download_part2parent[download_job.id]
+            assert mf_job is not None
+            self._mfd_active.pop(mf_job.id, None)
+            if not mf_job.in_terminal_state:
+                self._mfd_pending.pop(mf_job.id, None)
+                for part in mf_job.download_parts:
+                    if part is download_job:
+                        continue
+                    if part.paused or part.status == DownloadJobStatus.PAUSED:
+                        # A pause can be requested while the worker still reports RUNNING. Preserve that user's
+                        # partial file. A non-running part has no worker left to remove its parent link.
+                        if part.status != DownloadJobStatus.RUNNING:
+                            self._download_part2parent.pop(part.id, None)
+                        continue
+                    if part.in_terminal_state:
+                        continue
+                    part.cancel()
+                    self._cleanup_cancelled_job(part)
+                    part.status = DownloadJobStatus.CANCELLED
+                    part.job_ended = get_iso_timestamp()
+                    self._download_part2parent.pop(part.id, None)
+
+                mf_job.status = download_job.status
+                mf_job.error = download_job.error
+                mf_job.error_type = download_job.error_type
+                self._logger.error(
+                    f"Cancelling {mf_job.dest} due to an error while downloading {download_job.source}: {str(excp)}"
+                )
+                self._execute_cb(mf_job, "on_error", excp)
+                self._job_terminated_event.set()
+
+    def _execute_cb(
+        self,
+        job: DownloadJob | MultiFileDownloadJob,
+        callback_name: Literal[
+            "on_start",
+            "on_progress",
+            "on_complete",
+            "on_cancelled",
+            "on_error",
+        ],
+        excp: Optional[Exception] = None,
+    ) -> None:
+        if callback := getattr(job, callback_name, None):
+            args = [job, excp] if excp else [job]
+            try:
+                callback(*args)
+            except Exception as e:
+                self._logger.error(
+                    f"An error occurred while processing the {callback_name} callback: {traceback.format_exception(e)}"
+                )
+
+
+def get_pc_name_max(directory: str) -> int:
+    if hasattr(os, "pathconf"):
+        try:
+            return os.pathconf(directory, "PC_NAME_MAX")
+        except OSError:
+            # macOS w/ external drives raise OSError
+            pass
+    return 260  # hardcoded for windows
+
+
+def get_pc_path_max(directory: str) -> int:
+    if hasattr(os, "pathconf"):
+        try:
+            return os.pathconf(directory, "PC_PATH_MAX")
+        except OSError:
+            # some platforms may not have this value
+            pass
+    return 32767  # hardcoded for windows with long names enabled
+
+
+# Example on_progress event handler to display a TQDM status bar
+# Activate with:
+#   download_service.download(DownloadJob('http://foo.bar/baz', '/tmp', on_progress=TqdmProgress().update))
+class TqdmProgress(object):
+    """TQDM-based progress bar object to use in on_progress handlers."""
+
+    _bars: Dict[int, tqdm]  # type: ignore
+    _last: Dict[int, int]  # last bytes downloaded
+
+    def __init__(self) -> None:  # noqa D107
+        self._bars = {}
+        self._last = {}
+
+    def update(self, job: DownloadJob) -> None:  # noqa D102
+        job_id = job.id
+        # new job
+        if job_id not in self._bars:
+            assert job.download_path
+            dest = Path(job.download_path).name
+            self._bars[job_id] = tqdm(
+                desc=dest,
+                initial=0,
+                total=job.total_bytes,
+                unit="iB",
+                unit_scale=True,
+            )
+            self._last[job_id] = 0
+        self._bars[job_id].update(job.bytes - self._last[job_id])
+        self._last[job_id] = job.bytes
