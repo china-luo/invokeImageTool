@@ -158,8 +158,14 @@ class ModelRecordServiceSQL(ModelRecordServiceBase):
                     q.models.delete(current.key)
                 else:
                     installed_ids.add(current.provider_model_id)
-                    if current.name != desired_config.name:
+                    if (
+                        current.name != desired_config.name
+                        or current.capabilities != desired_config.capabilities
+                        or current.panel_schema != desired_config.panel_schema
+                    ):
                         current.name = desired_config.name
+                        current.capabilities = desired_config.capabilities
+                        current.panel_schema = desired_config.panel_schema
                         q.models.save(current.key, current.model_dump_json())
             for model_id, config in desired.items():
                 if model_id not in installed_ids:
