@@ -23,7 +23,12 @@ from invokeai.app.services.shared.database.queries.models import MAX_KEY_LENGTH,
 from invokeai.app.services.shared.database.schema.models import models
 from invokeai.app.services.shared.pagination import SQLiteDirection
 from invokeai.backend.model_manager.configs.controlnet import ControlAdapterDefaultSettings
-from invokeai.backend.model_manager.configs.external_api import ExternalApiModelConfig, ExternalModelCapabilities
+from invokeai.backend.model_manager.configs.external_api import (
+    ExternalApiModelConfig,
+    ExternalApiModelDefaultSettings,
+    ExternalModelCapabilities,
+    ExternalModelPanelSchema,
+)
 from invokeai.backend.model_manager.configs.lora import LoRA_LyCORIS_SDXL_Config
 from invokeai.backend.model_manager.configs.main import (
     Main_Diffusers_SD1_Config,
@@ -709,6 +714,34 @@ def test_sync_external_models_preserves_existing_identity_and_metadata(store: Mo
     assert {model.provider_model_id for model in records if model.provider_id == "custom"} == {"kept", "new"}
 
 
+def test_sync_external_models_refreshes_derived_controls_and_preserves_user_settings(
+    store: ModelRecordServiceSQL,
+) -> None:
+    current = _external_model("gpt-image-2.5-sunburst", "GPT Image")
+    current.description = "User notes"
+    current.tags = ["favorites"]
+    current.default_settings = ExternalApiModelDefaultSettings(width=768, height=1368)
+    current.is_default = True
+    store.add_model(current)
+    desired = _external_model("gpt-image-2.5-sunburst", "GPT Image")
+    desired.capabilities = ExternalModelCapabilities(
+        supports_reference_images=True, max_reference_images=1, supports_negative_prompt=False
+    )
+    desired.panel_schema = ExternalModelPanelSchema(
+        prompts=[{"name": "reference_images"}], image=[{"name": "dimensions"}]
+    )
+
+    for _ in range(2):
+        store.sync_external_models("custom", [desired])
+        refreshed = store.get_model(current.key)
+        assert refreshed == current.model_copy(
+            update={"capabilities": desired.capabilities, "panel_schema": desired.panel_schema}
+        )
+
+    store.sync_external_models("custom", [_external_model("gpt-image-2.5-sunburst", "GPT Image")])
+    assert store.get_model(current.key) == current
+
+
 def test_sync_external_models_rolls_back_entire_list_after_mid_insert_failure(
     store: ModelRecordServiceSQL, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -724,10 +757,13 @@ def test_sync_external_models_rolls_back_entire_list_after_mid_insert_failure(
         original(self, key, config)
 
     monkeypatch.setattr(ModelQueries, "insert", fail_second_insert)
+    refreshed = _external_model("kept", "Renamed")
+    refreshed.capabilities = ExternalModelCapabilities(supports_reference_images=True, max_reference_images=1)
+    refreshed.panel_schema = ExternalModelPanelSchema(prompts=[{"name": "reference_images"}])
     with pytest.raises(RuntimeError, match="scripted storage failure"):
         store.sync_external_models(
             "custom",
-            [_external_model("kept", "Renamed"), _external_model("new-1", "New 1"), _external_model("new-2", "New 2")],
+            [refreshed, _external_model("new-1", "New 1"), _external_model("new-2", "New 2")],
         )
     assert len(inserted) == 2
     assert store.get_model(kept.key) == kept

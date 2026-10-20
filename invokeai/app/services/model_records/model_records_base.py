@@ -175,10 +175,11 @@ class ModelRecordServiceBase(ABC):
 
     @abstractmethod
     def sync_external_models(self, provider_id: str, configs: list[ExternalApiModelConfig]) -> None:
-        """Atomically reconcile a provider's metadata-only models, preserving existing keys and metadata.
+        """Atomically reconcile a provider's metadata-only models, preserving existing keys and user settings.
 
-        Existing models are renamed, absent IDs are removed, and new IDs are inserted. All configs must belong
-        to the given provider, with at most 50 distinct IDs. A failure leaves the original model list unchanged.
+        Existing models receive the configured name, capabilities and panel schema; other metadata is preserved.
+        Absent IDs are removed and new IDs inserted. All configs must belong to the given provider, with at most
+        50 distinct IDs. A failure leaves the original model list unchanged.
         """
         pass
 

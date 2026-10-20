@@ -1,11 +1,17 @@
 """Custom endpoint configuration is isolated from real credentials and model directories."""
 
+import base64
+import dataclasses
+import io
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import requests
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from invokeai.app.api.dependencies import ApiDependencies
 from invokeai.app.api.routers import app_info
@@ -14,6 +20,13 @@ from invokeai.app.services.config.config_default import (
     load_and_migrate_config,
     load_external_api_keys,
 )
+from invokeai.app.services.external_generation.errors import ExternalProviderCapabilityError
+from invokeai.app.services.external_generation.external_generation_common import (
+    ExternalGenerationRequest,
+    ExternalReferenceImage,
+)
+from invokeai.app.services.external_generation.external_generation_default import ExternalGenerationService
+from invokeai.app.services.external_generation.providers.openai import CustomOpenAIProvider
 from invokeai.app.services.external_generation.startup import sync_custom_external_models
 from invokeai.app.services.invoker import Invoker
 from invokeai.app.services.model_records.model_records_sql import ModelRecordServiceSQL
@@ -249,3 +262,155 @@ def test_legacy_custom_configuration_without_protocol_loads_as_openai(
     )
     reloaded = load_and_migrate_config(path)
     assert reloaded.external_custom_models[0].protocol == "openai"
+
+
+@pytest.mark.parametrize(
+    ("model_id", "protocol", "supports_references"),
+    [
+        ("gpt-image-2.5-sunburst", "openai", True),
+        ("gpt-image-1", "openai", True),
+        ("gpt-image-2.5-sunburst", "xai", False),
+        ("gpt-image-2.5-sunburst", "gemini", False),
+        ("dall-e-3", "openai", False),
+        ("vendor/image-v2", "openai", False),
+        ("other-gpt-image-2", "openai", False),
+        ("gpt-image", "openai", False),
+    ],
+)
+def test_custom_reference_controls_match_model_and_protocol(
+    model_id: str, protocol: str, supports_references: bool, custom_setup: SimpleNamespace, client: TestClient
+) -> None:
+    response = client.post(
+        URL, json=PAYLOAD | {"models": [{"id": model_id, "name": "Image model", "protocol": protocol}]}
+    )
+    assert response.status_code == 200
+    model = _custom_models(custom_setup.store)[0]
+    assert model.capabilities.supports_reference_images is supports_references
+    assert model.capabilities.max_reference_images == (1 if supports_references else None)
+    assert model.capabilities.modes == ["txt2img"]
+    assert model.panel_schema is not None
+    assert [control.name for control in model.panel_schema.prompts] == (
+        ["reference_images"] if supports_references else []
+    )
+    assert [control.name for control in model.panel_schema.image] == ["dimensions"]
+
+
+@pytest.mark.parametrize("other_protocol", ["xai", "gemini"])
+def test_custom_reference_support_refreshes_existing_records_without_changing_keys(
+    other_protocol: str, custom_setup: SimpleNamespace, client: TestClient
+) -> None:
+    model_id = "gpt-image-2.5-sunburst"
+    old_model = custom_setup.store.add_model(
+        ExternalApiModelConfig(
+            name="Existing GPT Image",
+            provider_id="custom",
+            provider_model_id=model_id,
+            capabilities=ExternalModelCapabilities(supports_reference_images=False),
+        )
+    )
+    payload = PAYLOAD | {"models": [{"id": model_id, "name": "Existing GPT Image"}]}
+    assert client.post(URL, json=payload).status_code == 200
+    reloaded = load_and_migrate_config(custom_setup.config.config_file_path)
+    reloaded.update_config(load_external_api_keys(custom_setup.config.api_keys_file_path))
+    for _ in range(2):
+        sync_custom_external_models(reloaded, custom_setup.store)
+        models = _custom_models(custom_setup.store)
+        assert len(models) == 1
+        assert models[0].key == old_model.key
+        assert models[0].capabilities.supports_reference_images is True
+        assert models[0].capabilities.max_reference_images == 1
+
+    for protocol, supports_references in [(other_protocol, False), ("openai", True)]:
+        assert (
+            client.post(
+                URL, json={"models": [{"id": model_id, "name": "Existing GPT Image", "protocol": protocol}]}
+            ).status_code
+            == 200
+        )
+        models = _custom_models(custom_setup.store)
+        assert len(models) == 1
+        assert models[0].key == old_model.key
+        assert models[0].capabilities.supports_reference_images is supports_references
+        assert models[0].capabilities.max_reference_images == (1 if supports_references else None)
+        assert models[0].panel_schema is not None
+        assert [control.name for control in models[0].panel_schema.prompts] == (
+            ["reference_images"] if supports_references else []
+        )
+
+
+def test_synced_custom_reference_generation_refreshes_stale_capabilities_and_limits_inputs(
+    custom_setup: SimpleNamespace, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_id = "gpt-image-2.5-sunburst"
+    stale_model = custom_setup.store.add_model(
+        ExternalApiModelConfig(
+            name="Existing GPT Image",
+            provider_id="custom",
+            provider_model_id=model_id,
+            capabilities=ExternalModelCapabilities(supports_reference_images=False),
+        )
+    )
+    assert (
+        client.post(URL, json=PAYLOAD | {"models": [{"id": model_id, "name": "Existing GPT Image"}]}).status_code == 200
+    )
+    output = io.BytesIO()
+    Image.new("RGB", (3, 5), (4, 120, 200)).save(output, format="PNG")
+    post = Mock(
+        return_value=Mock(
+            ok=True,
+            status_code=200,
+            headers={"x-request-id": "reference-request"},
+            json=Mock(return_value={"data": [{"b64_json": base64.b64encode(output.getvalue()).decode("ascii")}]}),
+        )
+    )
+    monkeypatch.setattr(requests, "post", post)
+    logger = logging.getLogger("test")
+    service = ExternalGenerationService(
+        {"custom": CustomOpenAIProvider(custom_setup.config, logger)}, logger, record_store=custom_setup.store
+    )
+    reference = Image.new("RGBA", (7, 9), (20, 40, 60, 128))
+    request = ExternalGenerationRequest(
+        model=stale_model,
+        mode="txt2img",
+        prompt="Keep the subject and replace the background with a beach",
+        seed=None,
+        num_images=1,
+        width=768,
+        height=1368,
+        image_size=None,
+        init_image=None,
+        mask_image=None,
+        reference_images=[ExternalReferenceImage(image=reference)],
+        metadata=None,
+        provider_options={"quality": "high", "background": "opaque", "input_fidelity": "high"},
+    )
+    with pytest.raises(ExternalProviderCapabilityError, match="at most 1 reference images"):
+        service.generate(dataclasses.replace(request, reference_images=request.reference_images * 2))
+    post.assert_not_called()
+
+    result = service.generate(request)
+
+    post.assert_called_once()
+    assert post.call_args.args == ("https://images.example/v1/images/edits",)
+    assert post.call_args.kwargs["data"] == {
+        "model": model_id,
+        "prompt": "Keep the subject and replace the background with a beach",
+        "n": 1,
+        "size": "768x1368",
+        "output_format": "png",
+        "quality": "high",
+        "background": "opaque",
+        "input_fidelity": "high",
+    }
+    assert post.call_args.kwargs["timeout"] == 300
+    assert len(post.call_args.kwargs["files"]) == 1
+    field, (filename, image_buffer, content_type) = post.call_args.kwargs["files"][0]
+    assert (field, filename, content_type) == ("image", "image_0.png", "image/png")
+    with Image.open(image_buffer) as sent_reference:
+        assert sent_reference.format == "PNG"
+        assert sent_reference.size == (7, 9)
+        assert sent_reference.getpixel((0, 0)) == (20, 40, 60, 128)
+    assert len(result.images) == 1
+    assert result.images[0].image.size == (3, 5)
+    assert result.images[0].image.getpixel((0, 0)) == (4, 120, 200)
+    assert result.provider_request_id == "reference-request"

@@ -71,22 +71,26 @@ def sync_custom_external_models(config: InvokeAIAppConfig, store: ModelRecordSer
     desired = (
         config.external_custom_models if config.external_custom_api_key and config.external_custom_base_url else []
     )
-    store.sync_external_models(
-        "custom",
-        [
+    models: list[ExternalApiModelConfig] = []
+    for model in desired:
+        supports_reference_images = model.protocol == "openai" and model.id.startswith("gpt-image-")
+        models.append(
             ExternalApiModelConfig(
                 name=model.name,
                 provider_id="custom",
                 provider_model_id=model.id,
                 capabilities=ExternalModelCapabilities(
                     modes=["txt2img"],
-                    supports_reference_images=False,
+                    supports_reference_images=supports_reference_images,
+                    max_reference_images=1 if supports_reference_images else None,
                     supports_negative_prompt=False,
                     max_images_per_request=1,
                 ),
                 default_settings=ExternalApiModelDefaultSettings(width=1024, height=1024, num_images=1),
-                panel_schema=ExternalModelPanelSchema(image=[ExternalModelPanelControl(name="dimensions")]),
+                panel_schema=ExternalModelPanelSchema(
+                    prompts=[ExternalModelPanelControl(name="reference_images")] if supports_reference_images else [],
+                    image=[ExternalModelPanelControl(name="dimensions")],
+                ),
             )
-            for model in desired
-        ],
-    )
+        )
+    store.sync_external_models("custom", models)

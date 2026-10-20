@@ -60,7 +60,9 @@ Invoke uses `/v1` for OpenAI Images and Grok / xAI Images, and `/v1beta` for Gem
 
 The shared API key must be enabled for every configured model and protocol. Some services assign keys to a provider-specific group; a key enabled only for OpenAI-compatible models may not have access to Grok / xAI Images or Gemini native models. Use a key and service group that support the protocols you select.
 
-Models added through this form expose text-to-image generation only. The adapters' editing support does not automatically enable editing for a custom model. Chat endpoints such as `/chat/completions` and other provider-specific protocols are not supported by this configuration.
+Custom models using **OpenAI Images** whose Model ID starts with `gpt-image-` also accept **one reference image plus a text prompt**. Select the model, open **Generation → Guidance → Add Reference Image**, and upload an image or choose one from the gallery. Describe what to keep and what to change in the prompt, then generate. These requests use `/v1/images/edits`, so the service must support that endpoint for the selected model and API key. Saving the configuration or restarting Invoke refreshes this capability for existing model entries.
+
+Other custom models, including **Grok / xAI Images** and **Gemini native**, expose text-to-image generation only. Custom models do not expose canvas image-to-image or inpainting. Chat endpoints such as `/chat/completions` and other provider-specific protocols are not supported by this configuration.
 
 Clearing this configuration removes its custom model entries from Invoke. It does not delete locally installed models or generated images.
 
